@@ -72,6 +72,8 @@ def _support_mha_one_shot(attn, forward_batch, backend_name):
 def _handle_attention_backend(attn, forward_batch, backend_name):
     if is_in_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
+    if getattr(attn, "kv_cache_dtype", None) == "int2":
+        return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     disable_ragged = (
@@ -158,6 +160,8 @@ def handle_attention_nsa(attn, forward_batch):
 def handle_attention_triton(attn, forward_batch):
     if is_in_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
+    if getattr(attn, "kv_cache_dtype", None) == "int2":
+        return _dispatch_mla_subtype(attn, forward_batch)
 
     # when deterministic inference is enabled, use MLA
     if get_global_server_args().enable_deterministic_inference:
