@@ -6,6 +6,7 @@ export HF_HOME="${HF_HOME:-/shared/huggingface}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SGLANG_DUMP_DIR="${SGLANG_DUMP_DIR:-${REPO_ROOT}/sglang-dump-qkv}"
+OUTPUT_BASE_DIR="${OUTPUT_BASE_DIR:-${SCRIPT_DIR}}"
 
 MODEL="${MODEL:-zai-org/GLM-4.7-FP8}"
 TP_SIZE="${TP_SIZE:-8}"
@@ -26,7 +27,7 @@ export DUMP_KVCACHE_TOKENS="${DUMP_KVCACHE_TOKENS:-30000}"
 # Eval scripts find the right calibration by passing ROT_DIR explicitly.
 DATASET="${DATASET:-GPQA}"
 GROUP_SIZE="${GROUP_SIZE:-128}"
-CALIB_DIR="${SCRIPT_DIR}/${DATASET}/latest"
+CALIB_DIR="${OUTPUT_BASE_DIR}/${DATASET}/latest"
 export DUMP_KVCACHE_DIR="${DUMP_KVCACHE_DIR:-${CALIB_DIR}/qkv_dumps/gpqa}"
 mkdir -p "${DUMP_KVCACHE_DIR}"
 
@@ -144,8 +145,11 @@ log "  dump_runner_log=${DUMP_RUNNER_LOG}"
 if [[ -d "${DUMP_KVCACHE_DIR}/layer_0/q" ]]; then
     log "layer_0 q chunks:"
     ls "${DUMP_KVCACHE_DIR}/layer_0/q" | head -20
+elif [[ -d "${DUMP_KVCACHE_DIR}/layer_0/q_latent" ]]; then
+    log "layer_0 q_latent chunks:"
+    ls "${DUMP_KVCACHE_DIR}/layer_0/q_latent" | head -20
 else
-    log "Warning: ${DUMP_KVCACHE_DIR}/layer_0/q was not created"
+    log "Warning: neither ${DUMP_KVCACHE_DIR}/layer_0/q nor q_latent was created"
     exit 0
 fi
 
@@ -163,7 +167,7 @@ PYEOF
 log "  prompts_captured=${N_PROMPTS}"
 
 FINAL_TAG="seq${DUMP_KVCACHE_TOKENS}_prompt${N_PROMPTS}_group${GROUP_SIZE}"
-FINAL_DIR="${SCRIPT_DIR}/${DATASET}/${FINAL_TAG}"
+FINAL_DIR="${OUTPUT_BASE_DIR}/${DATASET}/${FINAL_TAG}"
 if [[ "${CALIB_DIR}" != "${FINAL_DIR}" ]]; then
     rm -rf "${FINAL_DIR}"
     mv "${CALIB_DIR}" "${FINAL_DIR}"

@@ -416,6 +416,13 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    model_dtype=self.dtype,
+                    kv_cache_quant_group_size=(
+                        self.server_args.kv_cache_quant_group_size
+                    ),
+                    scale_dtype=resolve_scale_dtype(
+                        envs.SGLANG_MIXED_KV_SCALE_DTYPE.get()
+                    ),
                 )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(

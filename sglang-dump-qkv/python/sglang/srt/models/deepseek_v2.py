@@ -72,6 +72,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -149,6 +150,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    get_int_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -1508,6 +1510,83 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
         return k_nope, k_pe
 
+    def _dump_mla_latent_kv_for_oscar(
+        self,
+        q_nope_out: torch.Tensor,
+        k_nope: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if not (
+            get_bool_env_var("DUMP_MLA_LATENT_KVCACHE", "false")
+            or get_bool_env_var("DUMP_KVCACHE", "false")
+        ):
+            return
+        if not forward_batch.forward_mode.is_extend():
+            return
+
+        if not hasattr(self, "_dump_mla_done_layers"):
+            self._dump_mla_done_layers = set()
+            self._dump_mla_saved_tokens = {}
+            self._dump_mla_chunk_idx = {}
+
+        layer_id = self.layer_id
+        if layer_id in self._dump_mla_done_layers:
+            return
+
+        dump_tokens = get_int_env_var("DUMP_KVCACHE_TOKENS", 100)
+        saved_so_far = self._dump_mla_saved_tokens.get(layer_id, 0)
+        remaining = dump_tokens - saved_so_far
+        if remaining <= 0:
+            self._dump_mla_done_layers.add(layer_id)
+            return
+
+        tokens_to_save = min(q_nope_out.shape[0], remaining)
+        chunk_idx = self._dump_mla_chunk_idx.get(layer_id, 0)
+        if str(q_nope_out.device).startswith("cuda"):
+            torch.cuda.synchronize()
+
+        q_dump = q_nope_out[:tokens_to_save].contiguous().detach()
+        k_dump = k_nope[:tokens_to_save].contiguous().detach()
+
+        chunk_seq_lens = []
+        if forward_batch.extend_seq_lens is not None:
+            remain = tokens_to_save
+            for slen in forward_batch.extend_seq_lens.tolist():
+                if remain <= 0:
+                    break
+                take = min(slen, remain)
+                chunk_seq_lens.append(take)
+                remain -= take
+        else:
+            chunk_seq_lens = [tokens_to_save]
+        chunk_seq_lens_t = torch.tensor(chunk_seq_lens, dtype=torch.int32)
+
+        tp_size = get_attention_tp_size()
+        tp_rank = get_attention_tp_rank()
+        if tp_size > 1:
+            q_dump = get_attention_tp_group().all_gather(q_dump, dim=1)
+
+        if tp_rank == 0:
+            save_dir = os.environ.get("DUMP_KVCACHE_DIR", ".")
+            for name, tensor in (("q_latent", q_dump), ("k_latent", k_dump)):
+                chunk_dir = os.path.join(save_dir, f"layer_{layer_id}", name)
+                os.makedirs(chunk_dir, exist_ok=True)
+                torch.save(tensor.cpu(), os.path.join(chunk_dir, f"{chunk_idx}.pt"))
+
+            seq_dir = os.path.join(save_dir, f"layer_{layer_id}", "seq_lens")
+            os.makedirs(seq_dir, exist_ok=True)
+            torch.save(chunk_seq_lens_t, os.path.join(seq_dir, f"{chunk_idx}.pt"))
+            print(
+                f"Dumped MLA latent chunk {chunk_idx} for layer {layer_id} "
+                f"({tokens_to_save} tokens, total "
+                f"{saved_so_far + tokens_to_save}/{dump_tokens})"
+            )
+
+        self._dump_mla_saved_tokens[layer_id] = saved_so_far + tokens_to_save
+        self._dump_mla_chunk_idx[layer_id] = chunk_idx + 1
+        if saved_so_far + tokens_to_save >= dump_tokens:
+            self._dump_mla_done_layers.add(layer_id)
+
     def forward_absorb_prepare(
         self,
         positions: torch.Tensor,
@@ -1719,6 +1798,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
             )
+
+        self._dump_mla_latent_kv_for_oscar(q_nope_out, k_nope, forward_batch)
 
         return (
             q_pe,

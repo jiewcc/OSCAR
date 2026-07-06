@@ -126,6 +126,37 @@ def _get_int_kv_bytes_per_head_pair(
     return packed_k_bytes + packed_v_bytes + scales_zeros_bytes
 
 
+def _get_mla_int_kv_bytes_per_token(
+    k_head_dim: int,
+    v_head_dim: int,
+    group_size: Optional[int],
+    scale_dtype_bytes: int = 4,
+) -> int:
+    """Bytes per MLA token in the int2 pool.
+
+    MLA K is ``[latent, rope]`` and is often not divisible by the CLI group
+    size used by MHA (for example 576 with group size 128). The runtime MLA
+    pool falls back to one affine group for that tensor in this case, so the
+    sizing logic mirrors that behavior.
+    """
+    pack_factor = 4
+
+    def groups_for(dim: int) -> int:
+        effective_group_size = dim if group_size is None else group_size
+        if effective_group_size <= 0:
+            raise ValueError(
+                f"kv_cache_quant_group_size must be positive, got {effective_group_size}"
+            )
+        return 1 if dim % effective_group_size != 0 else dim // effective_group_size
+
+    packed_k_bytes = k_head_dim // pack_factor
+    packed_v_bytes = v_head_dim // pack_factor
+    scales_zeros_bytes = 2 * scale_dtype_bytes * (
+        groups_for(k_head_dim) + groups_for(v_head_dim)
+    )
+    return packed_k_bytes + packed_v_bytes + scales_zeros_bytes
+
+
 def _get_unified_mixed_kv_bytes_per_quant_token(
     k_head_dim: int,
     v_head_dim: int,
@@ -278,11 +309,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             bytes_per_head = None
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            if kv_cache_dtype == "int2":
+                cell_size = (
+                    _get_mla_int_kv_bytes_per_token(
+                        model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+                        model_config.kv_lora_rank,
+                        kv_quant_group_size,
+                        scale_bytes,
+                    )
+                    * num_layers
+                )
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                    * num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

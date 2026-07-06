@@ -108,6 +108,13 @@ def compute_qqt(layer_dir: Path, chunk_id: int, head_dim: int):
     return eigvecs, eigvals
 
 
+def compute_mla_latent(layer_dir: Path, chunk_id: int, head_dim: int):
+    q_name = "q_latent" if (layer_dir / "q_latent").exists() else "q"
+    q = load_tensor(layer_dir, q_name, chunk_id)
+    q_flat = q.reshape(-1, head_dim)
+    return eigdecomp_from_flat(q_flat)
+
+
 def compute_sst(layer_dir: Path, chunk_id: int, head_dim: int):
     q = load_tensor(layer_dir, "q", chunk_id)
     k = load_tensor(layer_dir, "k", chunk_id)
@@ -219,6 +226,7 @@ HESSIAN_FNS = {
     "vtv": compute_vtv,
     "qqt": compute_qqt,
     "sst": compute_sst,
+    "mla_latent": compute_mla_latent,
 }
 
 METHOD_TARGETS = {
@@ -228,6 +236,7 @@ METHOD_TARGETS = {
     "sst": [("v", "sst")],
     "ktk_vtv": [("k", "ktk"), ("v", "vtv")],
     "qqt_sst": [("k", "qqt"), ("v", "sst")],
+    "mla_latent": [("latent", "mla_latent")],
 }
 
 
@@ -313,6 +322,58 @@ def write_hadamard_rotation(
         print(f"Saved: {path}")
 
 
+def write_mla_latent_rotations(
+    output_dir: Path,
+    dirs: list[Path],
+    chunk_id,
+    latent_dim: int,
+    rope_dim: int,
+    composition: str,
+) -> None:
+    hadamard = build_hadamard(latent_dim)
+    k_result = empty_result(f"mla_latent_{composition}")
+    v_result = empty_result(f"mla_latent_{composition}")
+    for layer_dir in dirs:
+        layer_id = int(layer_dir.name.split("_", 1)[1])
+        rotation, eigvals = compute_mla_latent(layer_dir, chunk_id, latent_dim)
+        latent_rotation = compose_rotation(rotation, eigvals, hadamard, composition)
+        latent_err = (
+            latent_rotation @ latent_rotation.T
+            - torch.eye(latent_dim, dtype=torch.float64)
+        ).abs().max().item()
+
+        if rope_dim > 0:
+            k_rotation = torch.block_diag(
+                latent_rotation,
+                torch.eye(rope_dim, dtype=torch.float64),
+            )
+            k_eigvals = torch.cat(
+                [eigvals, torch.ones(rope_dim, dtype=torch.float64)]
+            )
+        else:
+            k_rotation = latent_rotation
+            k_eigvals = eigvals
+
+        k_dim = latent_dim + rope_dim
+        k_err = (
+            k_rotation @ k_rotation.T - torch.eye(k_dim, dtype=torch.float64)
+        ).abs().max().item()
+        print(
+            f"  Layer {layer_id:>2}: latent={latent_err:.1e}, "
+            f"K(blockdiag)={k_err:.1e}"
+        )
+        add_layer(k_result, layer_id, k_rotation, k_eigvals)
+        add_layer(v_result, layer_id, latent_rotation, eigvals)
+
+    suffix = f"mla_latent_{composition}"
+    k_path = output_dir / f"k_rotation_{suffix}.pt"
+    v_path = output_dir / f"v_rotation_{suffix}.pt"
+    torch.save(k_result, str(k_path))
+    torch.save(v_result, str(v_path))
+    print(f"Saved: {k_path}")
+    print(f"Saved: {v_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -334,9 +395,16 @@ def main() -> None:
         required=True,
         choices=[
             "ktk", "vtv", "qqt", "sst", "ktk_vtv", "qqt_sst",
-            "uresidual", "hadamard",
+            "mla_latent", "uresidual", "hadamard",
         ],
         help="'hadamard' = fixed Hadamard matrix per layer (no calibration).",
+    )
+    parser.add_argument(
+        "--mla-rope-dim",
+        type=int,
+        default=0,
+        help="For --method mla_latent, append an identity rope block of this size "
+        "to the K rotation. The V rotation remains latent-only.",
     )
     parser.add_argument(
         "--composition",
@@ -391,6 +459,17 @@ def main() -> None:
     dirs = layer_dirs(args.dump_path)
     print(f"Found {len(dirs)} layers in {args.dump_path}")
     print(f"Method={args.method} composition={args.composition} chunk={args.chunk_id}")
+
+    if args.method == "mla_latent":
+        write_mla_latent_rotations(
+            output_dir,
+            dirs,
+            args.chunk_id,
+            args.head_dim,
+            args.mla_rope_dim,
+            args.composition,
+        )
+        return
 
     if args.method == "uresidual":
         if not args.ref_k_rotation or not args.ref_v_rotation:
