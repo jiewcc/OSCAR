@@ -59,7 +59,7 @@ CUDA_VISIBLE_DEVICES="${GPUS}" \
     --port "${PORT}" \
     --dist-init-addr "127.0.0.1:${DIST_PORT}" \
     --trust-remote-code \
-    ${EXTRA_SERVER_ARGS:---disable-cuda-graph} \
+    ${EXTRA_SERVER_ARGS:---disable-cuda-graph --disable-piecewise-cuda-graph} \
     >> "${LOG_SERVER}" 2>&1 &
 SERVER_PID=$!
 
