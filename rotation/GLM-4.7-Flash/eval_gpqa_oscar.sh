@@ -20,6 +20,6 @@ export V_CLIP="${V_CLIP:-0.92}"
 export NAME="${NAME:-gpqa_oscar_glm_4_7_flash_mla}"
 export K_ROT_FILENAME="${K_ROT_FILENAME:-k_rotation_mla_latent_r_h_pbr.pt}"
 export V_ROT_FILENAME="${V_ROT_FILENAME:-v_rotation_mla_latent_r_h_pbr.pt}"
-export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:---disable-cuda-graph --disable-piecewise-cuda-graph --prefill-attention-backend triton}"
+export EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:---disable-piecewise-cuda-graph --prefill-attention-backend triton}"
 
 exec bash "${SCRIPT_DIR}/../eval_oscar_gpqa.sh"
