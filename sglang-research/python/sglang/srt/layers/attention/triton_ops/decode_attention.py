@@ -918,6 +918,57 @@ def decode_attention_fwd_quantized(
         )
 
 
+def decode_attention_fwd_quantized_mla_rope(
+    q_latent,
+    q_rope,
+    k_buffer,
+    k_rope_buffer,
+    v_buffer,
+    k_scales_zeros,
+    v_scales_zeros,
+    o,
+    kv_indptr,
+    kv_indices,
+    attn_logits,
+    attn_lse,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    kv_dtype,
+    logit_cap=0.0,
+    sinks=None,
+    xai_temperature_len=-1,
+    output_lse=None,
+):
+    """INT2 MLA decode with quantized latent K/V and high-precision rope K."""
+    assert max_kv_splits == attn_logits.shape[2]
+    assert q_latent.shape[0] <= kv_indptr.shape[0] - 1
+    assert q_latent.shape[0] <= attn_logits.shape[0]
+    assert kv_dtype == "int2", f"Only int2 quant KV is supported, got {kv_dtype}"
+    if sinks is not None:
+        raise NotImplementedError("MLA rope int2 decode does not support sink tokens.")
+    decode_attention_fwd_grouped_quant_int2_mla_rope(
+        q_latent,
+        q_rope,
+        k_buffer,
+        k_rope_buffer,
+        v_buffer,
+        k_scales_zeros,
+        v_scales_zeros,
+        o,
+        kv_indptr,
+        kv_indices,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        output_lse=output_lse,
+    )
+
+
 # ---------------------------------------------------------------------------
 # INT2 quantized decode attention kernels
 # ---------------------------------------------------------------------------
@@ -1366,6 +1417,8 @@ def _fwd_grouped_kernel_stage1_quant_int2(
     V_Buffer,  # Quantized INT2 [cache_size, num_heads, head_dim//4] uint8 (packed)
     K_Scales_Zeros,  # [cache_size, num_heads, 2*groups] float32, interleaved scale/zero pairs
     V_Scales_Zeros,  # [cache_size, num_heads, 2*groups] float32
+    Q_Rope,
+    K_Rope_Buffer,
     sm_scale,
     kv_indptr,
     kv_indices,
@@ -1382,6 +1435,10 @@ def _fwd_grouped_kernel_stage1_quant_int2(
     stride_sz_kh,  # K scales_zeros stride for head
     stride_sz_vbs,  # V scales_zeros stride for cache
     stride_sz_vh,  # V scales_zeros stride for head
+    stride_q_rope_bs,
+    stride_q_rope_h,
+    stride_k_rope_bs,
+    stride_k_rope_h,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -1395,6 +1452,9 @@ def _fwd_grouped_kernel_stage1_quant_int2(
     xai_temperature_len: tl.constexpr,
     L: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    USE_MLA_ROPE: tl.constexpr,
+    L_ROPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -1699,6 +1759,28 @@ def _fwd_grouped_kernel_stage1_quant_int2(
             q_full = tl.reshape(q_full, (BLOCK_H, BLOCK_D))
 
             qk = tl.dot(q_full, k_full)
+
+            if USE_MLA_ROPE:
+                offs_rope = tl.arange(0, BLOCK_ROPE)
+                mask_rope = offs_rope < L_ROPE
+                q_rope = tl.load(
+                    Q_Rope
+                    + cur_batch * stride_q_rope_bs
+                    + cur_head[:, None] * stride_q_rope_h
+                    + offs_rope[None, :],
+                    mask=mask_h[:, None] & mask_rope[None, :],
+                    other=0.0,
+                )
+                k_rope = tl.load(
+                    K_Rope_Buffer
+                    + kv_loc[None, :] * stride_k_rope_bs
+                    + cur_kv_head * stride_k_rope_h
+                    + offs_rope[:, None],
+                    mask=(offs_n[None, :] < split_kv_end)
+                    & mask_rope[:, None],
+                    other=0.0,
+                )
+                qk += tl.dot(q_rope, k_rope)
 
             qk *= sm_scale
 
@@ -2106,6 +2188,8 @@ def _decode_grouped_att_m_fwd_quant_int2(
         v_buffer,
         k_scales_zeros,
         v_scales_zeros,
+        q,
+        k_buffer,
         sm_scale,
         kv_indptr,
         kv_indices,
@@ -2122,6 +2206,10 @@ def _decode_grouped_att_m_fwd_quant_int2(
         k_scales_zeros.stride(1),
         v_scales_zeros.stride(0),
         v_scales_zeros.stride(1),
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -2137,6 +2225,117 @@ def _decode_grouped_att_m_fwd_quant_int2(
         num_stages=num_stages,
         L=L,
         GROUP_SIZE=group_size,
+        USE_MLA_ROPE=False,
+        L_ROPE=0,
+        BLOCK_ROPE=1,
+        **extra_kargs,
+    )
+
+
+def _decode_grouped_att_m_fwd_quant_int2_mla_rope(
+    q_latent,
+    q_rope,
+    k_buffer,
+    k_rope_buffer,
+    v_buffer,
+    k_scales_zeros,
+    v_scales_zeros,
+    att_out,
+    att_lse,
+    kv_indptr,
+    kv_indices,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    logit_cap,
+    xai_temperature_len=-1,
+):
+    L = k_buffer.shape[-1] * 4
+    assert v_buffer.shape[-1] * 4 == L, "INT2 MLA latent K/V requires Lk == Lv"
+    assert q_latent.shape[-1] == L
+    BLOCK_D = triton.next_power_of_2(L)
+    group_size = _get_shared_kv_scale_group_size(
+        L, L, k_scales_zeros, v_scales_zeros
+    )
+
+    batch, head_num = q_latent.shape[0], q_latent.shape[1]
+    kv_group_num = q_latent.shape[1] // k_buffer.shape[1]
+    MAX_KV_SPLITS = max_kv_splits
+
+    if kv_group_num <= 8:
+        if batch >= 16:
+            _bn_default, _bh_default, _nw_default = 32, 4, 1
+        elif batch >= 4:
+            _bn_default, _bh_default, _nw_default = 64, 8, 2
+        else:
+            _bn_default, _bh_default, _nw_default = 128, 8, 4
+    else:
+        _bn_default = 128
+        _bh_default = 16 if batch >= 16 else 8
+        _nw_default = 4
+    BLOCK = int(os.environ.get("SGL_INT2_BLOCK_N", _bn_default))
+    BLOCK_H = int(os.environ.get("SGL_INT2_BLOCK_H", _bh_default))
+    num_warps = int(os.environ.get("SGL_INT2_NUM_WARPS", _nw_default))
+    num_stages = int(os.environ.get("SGL_INT2_NUM_STAGES", 3))
+    BLOCK_ROPE = triton.next_power_of_2(q_rope.shape[-1])
+
+    grid = (
+        batch,
+        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
+        MAX_KV_SPLITS,
+    )
+
+    extra_kargs = {}
+    if _is_hip:
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 1
+
+    _fwd_grouped_kernel_stage1_quant_int2[grid](
+        q_latent,
+        k_buffer,
+        v_buffer,
+        k_scales_zeros,
+        v_scales_zeros,
+        q_rope,
+        k_rope_buffer,
+        sm_scale,
+        kv_indptr,
+        kv_indices,
+        att_out,
+        att_lse,
+        num_kv_splits,
+        q_latent.stride(0),
+        q_latent.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        k_scales_zeros.stride(0),
+        k_scales_zeros.stride(1),
+        v_scales_zeros.stride(0),
+        v_scales_zeros.stride(1),
+        q_rope.stride(0),
+        q_rope.stride(1),
+        k_rope_buffer.stride(0),
+        k_rope_buffer.stride(1),
+        att_out.stride(0),
+        att_out.stride(1),
+        att_out.stride(2),
+        kv_group_num=kv_group_num,
+        q_head_num=head_num,
+        BLOCK_D=BLOCK_D,
+        BLOCK_N=BLOCK,
+        BLOCK_H=BLOCK_H,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        L=L,
+        GROUP_SIZE=group_size,
+        USE_MLA_ROPE=True,
+        L_ROPE=q_rope.shape[-1],
+        BLOCK_ROPE=BLOCK_ROPE,
         **extra_kargs,
     )
 
@@ -2257,6 +2456,59 @@ def decode_attention_fwd_grouped_quant_int2(
         num_kv_splits=num_kv_splits,
         max_kv_splits=max_kv_splits,
         sinks=sinks,
+        output_lse=output_lse,
+    )
+
+
+def decode_attention_fwd_grouped_quant_int2_mla_rope(
+    q_latent,
+    q_rope,
+    k_buffer,
+    k_rope_buffer,
+    v_buffer,
+    k_scales_zeros,
+    v_scales_zeros,
+    o,
+    kv_indptr,
+    kv_indices,
+    attn_logits,
+    attn_lse,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    logit_cap=0.0,
+    xai_temperature_len=-1,
+    output_lse=None,
+):
+    _decode_grouped_att_m_fwd_quant_int2_mla_rope(
+        q_latent,
+        q_rope,
+        k_buffer,
+        k_rope_buffer,
+        v_buffer,
+        k_scales_zeros,
+        v_scales_zeros,
+        attn_logits,
+        attn_lse,
+        kv_indptr,
+        kv_indices,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale,
+        logit_cap,
+        xai_temperature_len,
+    )
+    _decode_softmax_reducev_fwd(
+        attn_logits,
+        attn_lse,
+        q_latent,
+        o,
+        v_scale=1.0,
+        v_buffer=o,
+        kv_indptr=kv_indptr,
+        num_kv_splits=num_kv_splits,
+        max_kv_splits=max_kv_splits,
+        sinks=None,
         output_lse=output_lse,
     )
 

@@ -129,15 +129,14 @@ def _get_int_kv_bytes_per_head_pair(
 def _get_mla_int_kv_bytes_per_token(
     k_head_dim: int,
     v_head_dim: int,
+    k_rope_head_dim: int,
     group_size: Optional[int],
     scale_dtype_bytes: int = 4,
+    rope_dtype_bytes: int = 2,
 ) -> int:
     """Bytes per MLA token in the int2 pool.
 
-    MLA K is ``[latent, rope]`` and is often not divisible by the CLI group
-    size used by MHA (for example 576 with group size 128). The runtime MLA
-    pool falls back to one affine group for that tensor in this case, so the
-    sizing logic mirrors that behavior.
+    MLA int2 stores latent K/V in int2 and keeps rope K in model precision.
     """
     pack_factor = 4
 
@@ -154,7 +153,8 @@ def _get_mla_int_kv_bytes_per_token(
     scales_zeros_bytes = 2 * scale_dtype_bytes * (
         groups_for(k_head_dim) + groups_for(v_head_dim)
     )
-    return packed_k_bytes + packed_v_bytes + scales_zeros_bytes
+    rope_bytes = k_rope_head_dim * rope_dtype_bytes
+    return packed_k_bytes + packed_v_bytes + scales_zeros_bytes + rope_bytes
 
 
 def _get_unified_mixed_kv_bytes_per_quant_token(
@@ -312,10 +312,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if kv_cache_dtype == "int2":
                 cell_size = (
                     _get_mla_int_kv_bytes_per_token(
-                        model_config.kv_lora_rank + model_config.qk_rope_head_dim,
                         model_config.kv_lora_rank,
+                        model_config.kv_lora_rank,
+                        model_config.qk_rope_head_dim,
                         kv_quant_group_size,
                         scale_bytes,
+                        torch._utils._element_size(mr.dtype),
                     )
                     * num_layers
                 )

@@ -306,10 +306,17 @@ def dequantize_prefix_kv(
     ``dequantize_kv_int2_triton`` internally.
     """
     device = prefix_indices.device
+    has_mla_rope_buffer = (
+        getattr(kv_pool, "get_key_rope_buffer", None) is not None
+        and getattr(kv_pool, "qk_rope_head_dim", 0) > 0
+    )
+    k_head_dim = kv_pool.head_dim + (
+        kv_pool.qk_rope_head_dim if has_mla_rope_buffer else 0
+    )
     if prefix_indices.numel() == 0:
         return (
             torch.empty(
-                (0, kv_pool.head_num, kv_pool.head_dim),
+                (0, kv_pool.head_num, k_head_dim),
                 dtype=model_dtype,
                 device=device,
             ),
@@ -356,8 +363,19 @@ def dequantize_prefix_kv(
     assert kv_pool.dtype == "int2", (
         f"Unsupported quantized KV dtype: {kv_pool.dtype}"
     )
+    prefix_k = dequantize_kv_int2_triton(
+        raw_k, scales_k, kv_pool.head_dim, model_dtype
+    )
+    if has_mla_rope_buffer:
+        prefix_k = torch.cat(
+            [
+                prefix_k,
+                kv_pool.get_key_rope_buffer(layer_id)[prefix_indices].to(model_dtype),
+            ],
+            dim=-1,
+        )
     return (
-        dequantize_kv_int2_triton(raw_k, scales_k, kv_pool.head_dim, model_dtype),
+        prefix_k,
         dequantize_kv_int2_triton(raw_v, scales_v, kv_pool.v_head_dim, model_dtype),
     )
 

@@ -1809,12 +1809,12 @@ class MLATokenToKVPool(KVCache):
             if self.nsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
-        self.head_dim = self.kv_cache_dim
+        self.head_dim = self.kv_lora_rank if self.dtype == "int2" else self.kv_cache_dim
         self.v_head_dim = self.kv_lora_rank
 
         if self.dtype == "int2":
             self.k_quant_group_size, self.k_num_scale_groups = (
-                self._resolve_int2_quant_grouping(self.head_dim, "MLA K")
+                self._resolve_int2_quant_grouping(self.kv_lora_rank, "MLA latent K")
             )
             self.v_quant_group_size, self.v_num_scale_groups = (
                 self._resolve_int2_quant_grouping(self.v_head_dim, "MLA V")
@@ -1830,7 +1830,7 @@ class MLATokenToKVPool(KVCache):
                 cfg.k_rotation_path,
                 self.layer_num,
                 self.start_layer,
-                self.head_dim,
+                self.kv_cache_dim,
                 torch.device(self.device),
                 dtype=rotation_dtype,
             )
@@ -1860,12 +1860,19 @@ class MLATokenToKVPool(KVCache):
                 dtype=torch.uint64,
                 device=self.device,
             )
+            self.k_rope_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.k_rope_buffer],
+                dtype=torch.uint64,
+                device=self.device,
+            )
             self.v_data_ptrs = torch.tensor(
                 [x.data_ptr() for x in self.v_buffer],
                 dtype=torch.uint64,
                 device=self.device,
             )
-            self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+            self.data_ptrs = torch.cat(
+                [self.k_data_ptrs, self.k_rope_data_ptrs, self.v_data_ptrs], dim=0
+            )
         else:
             self.data_ptrs = torch.tensor(
                 [x.data_ptr() for x in self.kv_buffer],
@@ -1931,6 +1938,18 @@ class MLATokenToKVPool(KVCache):
                         )
                         for _ in range(self.layer_num)
                     ]
+                    self.k_rope_buffer = [
+                        torch.zeros(
+                            (
+                                self.size + self.page_size,
+                                1,
+                                self.qk_rope_head_dim,
+                            ),
+                            dtype=self.model_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
                     self.v_buffer = [
                         torch.zeros(
                             (self.size + self.page_size, 1, self.v_head_dim // 4),
@@ -1959,6 +1978,7 @@ class MLATokenToKVPool(KVCache):
     def _clear_buffers(self):
         if self.dtype == "int2":
             del self.k_buffer
+            del self.k_rope_buffer
             del self.v_buffer
             del self.k_scales_zeros
             del self.v_scales_zeros
@@ -1969,7 +1989,7 @@ class MLATokenToKVPool(KVCache):
         if self.dtype == "int2":
             k_size_bytes = get_tensor_size_bytes(self.k_buffer) + get_tensor_size_bytes(
                 self.k_scales_zeros
-            )
+            ) + get_tensor_size_bytes(self.k_rope_buffer)
             v_size_bytes = get_tensor_size_bytes(self.v_buffer) + get_tensor_size_bytes(
                 self.v_scales_zeros
             )
@@ -1981,13 +2001,19 @@ class MLATokenToKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         if self.dtype == "int2":
             kv_data_ptrs = [x.data_ptr() for x in self.k_buffer] + [
+                x.data_ptr() for x in self.k_rope_buffer
+            ] + [
                 x.data_ptr() for x in self.v_buffer
             ]
             kv_data_lens = [x.nbytes for x in self.k_buffer] + [
+                x.nbytes for x in self.k_rope_buffer
+            ] + [
                 x.nbytes for x in self.v_buffer
             ]
             kv_item_lens = [
                 x[0].nbytes * self.page_size for x in self.k_buffer
+            ] + [
+                x[0].nbytes * self.page_size for x in self.k_rope_buffer
             ] + [x[0].nbytes * self.page_size for x in self.v_buffer]
             return kv_data_ptrs, kv_data_lens, kv_item_lens
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
@@ -2030,6 +2056,11 @@ class MLATokenToKVPool(KVCache):
     def get_raw_value_buffer(self, layer_id: int):
         return self.get_value_buffer(layer_id)
 
+    def get_key_rope_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.k_rope_buffer[layer_id - self.start_layer]
+
     def get_key_scales_zeros(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -2057,11 +2088,29 @@ class MLATokenToKVPool(KVCache):
         assert not self.nsa_kv_cache_store_fp8
         if self.dtype == "int2":
             layer_idx = layer_id - self.start_layer
+            if cache_k.shape[-1] == self.kv_cache_dim:
+                cache_k_latent = cache_k[..., : self.kv_lora_rank]
+                cache_k_rope = cache_k[..., self.kv_lora_rank :]
+            else:
+                cache_k_latent = cache_k
+                cache_k_rope = None
             if not already_hadamard_transformed:
-                cache_k = (cache_k.to(self._R_k[layer_idx].dtype) @ self._R_k[layer_idx]).contiguous()
-                cache_v = (cache_v.to(self._R_v[layer_idx].dtype) @ self._R_v[layer_idx]).contiguous()
+                if cache_k_rope is not None:
+                    cache_k_full = torch.cat([cache_k_latent, cache_k_rope], dim=-1)
+                    cache_k_rot = (
+                        cache_k_full.to(self._R_k[layer_idx].dtype)
+                        @ self._R_k[layer_idx]
+                    ).contiguous()
+                    cache_k_latent = cache_k_rot[..., : self.kv_lora_rank]
+                else:
+                    cache_k_latent = cache_k_latent.contiguous()
+                cache_v = (
+                    cache_v.to(self._R_v[layer_idx].dtype) @ self._R_v[layer_idx]
+                ).contiguous()
+            if cache_k_rope is not None:
+                self.k_rope_buffer[layer_idx][loc] = cache_k_rope.to(self.model_dtype)
             quantized_set_kv_int2_triton(
-                cache_k,
+                cache_k_latent.contiguous(),
                 cache_v,
                 loc,
                 self.k_buffer[layer_idx],
@@ -2090,8 +2139,12 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         if self.dtype == "int2":
-            cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
-            self.set_kv_buffer(layer, loc, cache_k, cache_k_nope)
+            self.set_kv_buffer(
+                layer,
+                loc,
+                torch.cat([cache_k_nope, cache_k_rope], dim=-1),
+                cache_k_nope,
+            )
             return
 
         if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
@@ -2147,14 +2200,7 @@ class MLATokenToKVPool(KVCache):
         if self.dtype == "int2":
             layer_idx = layer_id - self.start_layer
             dst_dtype = dst_dtype or self.model_dtype
-            raw_k = self.k_buffer[layer_idx][loc]
             raw_v = self.v_buffer[layer_idx][loc]
-            k_rot = dequantize_kv_int2_triton(
-                raw_k,
-                self.k_scales_zeros[layer_idx][loc],
-                self.head_dim,
-                dst_dtype,
-            )
             v_rot = dequantize_kv_int2_triton(
                 raw_v,
                 self.v_scales_zeros[layer_idx][loc],
@@ -2164,7 +2210,7 @@ class MLATokenToKVPool(KVCache):
             cache_k_nope = (
                 v_rot.to(self._R_v[layer_idx].dtype) @ self._R_v[layer_idx].T
             ).to(dst_dtype)
-            cache_k_rope = k_rot[..., self.kv_lora_rank :].to(dst_dtype)
+            cache_k_rope = self.k_rope_buffer[layer_idx][loc].to(dst_dtype)
             return cache_k_nope.contiguous(), cache_k_rope.contiguous()
 
         kv_buffer = self.get_key_buffer(layer_id)

@@ -204,6 +204,7 @@ class TritonAttnBackend(AttentionBackend):
             decode_attention_fwd,
             decode_attention_fwd_int2_unified,
             decode_attention_fwd_quantized,
+            decode_attention_fwd_quantized_mla_rope,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             build_unified_kv_indices,
@@ -216,6 +217,9 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         self.decode_attention_fwd_quantized = torch.compiler.disable(
             decode_attention_fwd_quantized
+        )
+        self.decode_attention_fwd_quantized_mla_rope = torch.compiler.disable(
+            decode_attention_fwd_quantized_mla_rope
         )
         self.decode_attention_fwd_int2_unified = torch.compiler.disable(
             decode_attention_fwd_int2_unified
@@ -1850,7 +1854,20 @@ class TritonAttnBackend(AttentionBackend):
 
             oscar_layer_idx = layer.layer_id - kv_pool.start_layer
 
-            if uses_oscar:
+            use_mla_rope_int2 = (
+                uses_oscar
+                and getattr(kv_pool, "get_key_rope_buffer", None) is not None
+                and getattr(kv_pool, "qk_rope_head_dim", 0) > 0
+            )
+            q_rope_for_decode = None
+            if use_mla_rope_int2:
+                q_latent = q_for_decode[..., : kv_pool.kv_lora_rank]
+                q_rope_for_decode = q_for_decode[..., kv_pool.kv_lora_rank :]
+                R_k_latent = kv_pool._R_k[oscar_layer_idx][
+                    : kv_pool.kv_lora_rank, : kv_pool.kv_lora_rank
+                ]
+                q_for_decode = _apply_oscar_rotation(q_latent, R_k_latent)
+            elif uses_oscar:
                 q_for_decode = _apply_oscar_rotation(
                     q_for_decode, kv_pool._R_k[oscar_layer_idx]
                 )
@@ -1883,7 +1900,29 @@ class TritonAttnBackend(AttentionBackend):
                     xai_temperature_len=layer.xai_temperature_len,
                 )
             else:
-                if getattr(kv_pool, "head_dim", layer.qk_head_dim) != getattr(
+                if use_mla_rope_int2:
+                    self.decode_attention_fwd_quantized_mla_rope(
+                        q_for_decode,
+                        q_rope_for_decode,
+                        kv_pool.get_raw_key_buffer(layer.layer_id),
+                        kv_pool.get_key_rope_buffer(layer.layer_id),
+                        kv_pool.get_raw_value_buffer(layer.layer_id),
+                        kv_pool.get_key_scales_zeros(layer.layer_id),
+                        kv_pool.get_value_scales_zeros(layer.layer_id),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        kv_indptr,
+                        kv_indices,
+                        self.forward_metadata.attn_logits,
+                        self.forward_metadata.attn_lse,
+                        self.forward_metadata.num_kv_splits,
+                        self.max_kv_splits,
+                        layer.scaling,
+                        kv_pool.dtype,
+                        logit_cap=logits_soft_cap,
+                        sinks=sinks,
+                        xai_temperature_len=layer.xai_temperature_len,
+                    )
+                elif getattr(kv_pool, "head_dim", layer.qk_head_dim) != getattr(
                     kv_pool, "v_head_dim", layer.v_head_dim
                 ):
                     self._decode_attention_fwd_int2_mla_fallback(
