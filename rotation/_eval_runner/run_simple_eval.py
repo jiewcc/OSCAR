@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -66,7 +67,10 @@ class SglangChatSampler:
     def __init__(self, model, base_url, api_key, system_message,
                  temperature, top_p, top_k, max_tokens):
         from openai import OpenAI
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        request_timeout = float(os.environ.get("OPENAI_TIMEOUT", "3600"))
+        self.client = OpenAI(
+            base_url=base_url, api_key=api_key, timeout=request_timeout
+        )
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
