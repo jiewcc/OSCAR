@@ -104,6 +104,10 @@ SERVER_ARGS=(
 if [[ -n "${REASONING_PARSER:-}" ]]; then
     SERVER_ARGS+=(--reasoning-parser "${REASONING_PARSER}")
 fi
+if [[ -n "${EXTRA_SERVER_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    SERVER_ARGS+=(${EXTRA_SERVER_ARGS})
+fi
 
 echo "[eval-oscar] model=${MODEL} tp=${TP_SIZE} gpus=${GPUS} rot=${ROT_DIR} out=${RUN_DIR}"
 SGLANG_ENABLE_MIXED_KV_WINDOWS=1 \
