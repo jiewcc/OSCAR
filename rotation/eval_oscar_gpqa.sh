@@ -46,10 +46,15 @@ NAME="${NAME:-gpqa_oscar}"
 
 CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV_NAME}"
+if [[ "${SKIP_CONDA:-0}" != "1" ]]; then
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV_NAME}"
+fi
 
-export PATH="${CONDA_PREFIX}/bin:${PATH}"
+PY="${PY:-python}"
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    export PATH="${CONDA_PREFIX}/bin:${PATH}"
+fi
 # Prepend per-rank Triton cache redirector so TP workers don't race on shared
 # launcher .so / metadata files in TRITON_CACHE_DIR.
 export PYTHONPATH="${REPO_ROOT}/rotation/_triton_per_rank:${SGLANG_RESEARCH_DIR}/python:${PYTHONPATH:-}"
@@ -115,7 +120,7 @@ SGLANG_OSCAR_K_CLIP_RATIO="${K_CLIP:-0.96}" \
 SGLANG_OSCAR_V_CLIP_RATIO="${V_CLIP:-0.92}" \
 SGLANG_LLOYD_MAX="${SGLANG_LLOYD_MAX:-0}" \
 CUDA_VISIBLE_DEVICES="${GPUS}" \
-python -m sglang.launch_server "${SERVER_ARGS[@]}" >> "${LOG_SERVER}" 2>&1 &
+"${PY}" -m sglang.launch_server "${SERVER_ARGS[@]}" >> "${LOG_SERVER}" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 240); do
@@ -139,7 +144,7 @@ fi
 
 echo "[eval-oscar] launching eval via simple_evals (vendored at third_party/simple_evals)"
 RUNNER="${REPO_ROOT}/rotation/_eval_runner/run_simple_eval.py"
-python "${RUNNER}" \
+"${PY}" "${RUNNER}" \
     --task gpqa \
     --model "${MODEL}" \
     --base-url "http://127.0.0.1:${PORT}/v1" \

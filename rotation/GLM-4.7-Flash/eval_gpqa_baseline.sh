@@ -18,10 +18,15 @@ MAX_RUNNING="${MAX_RUNNING:-64}"
 
 CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV_NAME}"
+if [[ "${SKIP_CONDA:-0}" != "1" ]]; then
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV_NAME}"
+fi
 
-export PATH="${CONDA_PREFIX}/bin:${PATH}"
+PY="${PY:-python}"
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    export PATH="${CONDA_PREFIX}/bin:${PATH}"
+fi
 export PYTHONPATH="${SGLANG_RESEARCH_DIR}/python:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 
@@ -42,7 +47,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 CUDA_VISIBLE_DEVICES="${GPUS}" \
-python -m sglang.launch_server \
+"${PY}" -m sglang.launch_server \
     --model-path "${MODEL}" \
     --tensor-parallel-size "${TP_SIZE}" \
     --prefill-attention-backend triton \
@@ -71,7 +76,7 @@ for _ in $(seq 1 240); do
 done
 
 RUNNER="${REPO_ROOT}/rotation/_eval_runner/run_simple_eval.py"
-python "${RUNNER}" \
+"${PY}" "${RUNNER}" \
     --task gpqa \
     --model "${MODEL}" \
     --base-url "http://127.0.0.1:${PORT}/v1" \
