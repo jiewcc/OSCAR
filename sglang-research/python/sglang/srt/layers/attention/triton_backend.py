@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.quantized_kv_prefill import (
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_quant_kernels import dequantize_kv_int2_triton
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
@@ -1825,26 +1826,39 @@ class TritonAttnBackend(AttentionBackend):
                     xai_temperature_len=layer.xai_temperature_len,
                 )
             else:
-                # Use optimized quantized attention kernel
-                self.decode_attention_fwd_quantized(
-                    q_for_decode,
-                    kv_pool.get_raw_key_buffer(layer.layer_id),
-                    kv_pool.get_raw_value_buffer(layer.layer_id),
-                    kv_pool.get_key_scales_zeros(layer.layer_id),
-                    kv_pool.get_value_scales_zeros(layer.layer_id),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    kv_indptr,
-                    kv_indices,
-                    self.forward_metadata.attn_logits,
-                    self.forward_metadata.attn_lse,
-                    self.forward_metadata.num_kv_splits,
-                    self.max_kv_splits,
-                    layer.scaling,
-                    kv_pool.dtype,
-                    logit_cap=logits_soft_cap,
-                    sinks=sinks,
-                    xai_temperature_len=layer.xai_temperature_len,
-                )
+                if getattr(kv_pool, "head_dim", layer.qk_head_dim) != getattr(
+                    kv_pool, "v_head_dim", layer.v_head_dim
+                ):
+                    self._decode_attention_fwd_int2_mla_fallback(
+                        q_for_decode,
+                        kv_pool,
+                        layer,
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        kv_indptr,
+                        kv_indices,
+                        logits_soft_cap,
+                    )
+                else:
+                    # Use optimized quantized attention kernel
+                    self.decode_attention_fwd_quantized(
+                        q_for_decode,
+                        kv_pool.get_raw_key_buffer(layer.layer_id),
+                        kv_pool.get_raw_value_buffer(layer.layer_id),
+                        kv_pool.get_key_scales_zeros(layer.layer_id),
+                        kv_pool.get_value_scales_zeros(layer.layer_id),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        kv_indptr,
+                        kv_indices,
+                        self.forward_metadata.attn_logits,
+                        self.forward_metadata.attn_lse,
+                        self.forward_metadata.num_kv_splits,
+                        self.max_kv_splits,
+                        layer.scaling,
+                        kv_pool.dtype,
+                        logit_cap=logits_soft_cap,
+                        sinks=sinks,
+                        xai_temperature_len=layer.xai_temperature_len,
+                    )
             # int2: V is always rotated, so apply the inverse rotation to the
             # output. Oscar mode uses ``o @ R_v.T``; Hadamard mode re-applies
             # the segmented FWHT (self-inverse with 1/sqrt(N)).
@@ -1875,6 +1889,47 @@ class TritonAttnBackend(AttentionBackend):
                 xai_temperature_len=layer.xai_temperature_len,
             )
         return o
+
+    def _decode_attention_fwd_int2_mla_fallback(
+        self,
+        q: torch.Tensor,
+        kv_pool,
+        layer: RadixAttention,
+        o: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        logits_soft_cap: float,
+    ) -> None:
+        raw_k = kv_pool.get_raw_key_buffer(layer.layer_id)
+        raw_v = kv_pool.get_raw_value_buffer(layer.layer_id)
+        k_scales_zeros = kv_pool.get_key_scales_zeros(layer.layer_id)
+        v_scales_zeros = kv_pool.get_value_scales_zeros(layer.layer_id)
+
+        for batch_idx in range(q.shape[0]):
+            start = int(kv_indptr[batch_idx].item())
+            end = int(kv_indptr[batch_idx + 1].item())
+            if end <= start:
+                o[batch_idx].zero_()
+                continue
+
+            loc = kv_indices[start:end]
+            k = dequantize_kv_int2_triton(
+                raw_k[loc],
+                k_scales_zeros[loc],
+                kv_pool.head_dim,
+                q.dtype,
+            ).squeeze(1)
+            v = dequantize_kv_int2_triton(
+                raw_v[loc],
+                v_scales_zeros[loc],
+                kv_pool.v_head_dim,
+                q.dtype,
+            ).squeeze(1)
+            scores = torch.matmul(q[batch_idx], k.transpose(0, 1)) * layer.scaling
+            if logits_soft_cap > 0:
+                scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+            probs = torch.softmax(scores.float(), dim=-1).to(v.dtype)
+            o[batch_idx].copy_(torch.matmul(probs, v))
 
 
 class TritonMultiStepDraftBackend:
