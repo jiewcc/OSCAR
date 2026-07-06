@@ -589,6 +589,63 @@ class TritonAttnBackend(AttentionBackend):
 
         unified_k = torch.cat(unified_k_parts, dim=0) if unified_k_parts else k3[:0]
         unified_v = torch.cat(unified_v_parts, dim=0) if unified_v_parts else v3[:0]
+
+        if unified_k.shape[-1] > 256 or unified_k.shape[-1] != unified_v.shape[-1]:
+            result_parts = []
+            unified_offset = 0
+            qo_indptr = self.forward_metadata.qo_indptr
+            for i, extend_len in enumerate(forward_batch.extend_seq_lens_cpu):
+                q_start = int(qo_indptr[i].item())
+                q_end = int(qo_indptr[i + 1].item())
+                kv_len = unified_k_lens[i]
+                req_q = q3[q_start:q_end]
+                req_k = unified_k[unified_offset : unified_offset + kv_len]
+                req_v = unified_v[unified_offset : unified_offset + kv_len]
+                unified_offset += kv_len
+
+                if req_q.numel() == 0:
+                    continue
+                if req_k.shape[1] == 1:
+                    scores = (
+                        torch.einsum("qhd,kd->qhk", req_q, req_k[:, 0])
+                        * layer.scaling
+                    )
+                else:
+                    scores = (
+                        torch.einsum("qhd,khd->qhk", req_q, req_k) * layer.scaling
+                    )
+                if causal:
+                    prefix_len = kv_len - int(extend_len)
+                    key_pos = torch.arange(kv_len, device=req_q.device)
+                    query_pos = prefix_len + torch.arange(
+                        req_q.shape[0], device=req_q.device
+                    )
+                    causal_mask = key_pos.view(1, 1, kv_len) > query_pos.view(
+                        -1, 1, 1
+                    )
+                    scores = scores.masked_fill(causal_mask, float("-inf"))
+                logits_soft_cap = logit_capping_mod(
+                    layer.logit_capping_method, layer.logit_cap
+                )
+                if logits_soft_cap > 0:
+                    scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+                probs = torch.softmax(scores.float(), dim=-1).to(req_v.dtype)
+                if req_v.shape[1] == 1:
+                    result_parts.append(
+                        torch.einsum("qhk,kd->qhd", probs, req_v[:, 0])
+                    )
+                else:
+                    result_parts.append(torch.einsum("qhk,khd->qhd", probs, req_v))
+
+            result = (
+                torch.cat(result_parts, dim=0)
+                if result_parts
+                else q3.new_empty((0, layer.tp_q_head_num, layer.v_head_dim))
+            )
+            result = apply_inverse_v_rotation(result, kv_pool, layer, need_v_inverse)
+            o.copy_(result.view_as(o))
+            return o
+
         cu_seqlens_q = self.forward_metadata.qo_indptr.to(torch.int32)
         cu_seqlens_k = torch.empty(
             (len(unified_k_lens) + 1,), dtype=torch.int32, device=self.device
