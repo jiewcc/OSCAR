@@ -67,7 +67,7 @@ class SglangChatSampler:
     def __init__(self, model, base_url, api_key, system_message,
                  temperature, top_p, top_k, max_tokens):
         from openai import OpenAI
-        request_timeout = float(os.environ.get("OPENAI_TIMEOUT", "3600"))
+        request_timeout = float(os.environ.get("OPENAI_TIMEOUT", "14400"))
         self.client = OpenAI(
             base_url=base_url, api_key=api_key, timeout=request_timeout
         )
