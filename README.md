@@ -273,6 +273,62 @@ ROT_DIR=$(ls -1d rotation/qwen3-8B/GPQA/seq*_prompt*_group*/rotations | tail -1)
   bash rotation/qwen3-8B/eval_gpqa.sh
 ```
 
+### Optional: run the five benchmark tasks
+
+`rotation/eval_benchmark.sh` supports both OSCAR and BF16/baseline serving for
+`gpqa`, `aime25`, `math500`, `humaneval`, and `lcbv6`.
+
+```bash
+# OSCAR INT2 KV-cache
+MODEL=/path/to/Qwen3-8B \
+ROT_DIR=rotation/qwen3-8B/GPQA/seq30000_prompt<N>_group128/rotations \
+DATA_ROOT=/home/relay/wangzijie/model \
+TASK=math500 KV_MODE=oscar TP_SIZE=2 GPUS=4,5 \
+bash rotation/qwen3-8B/eval_benchmark.sh
+
+# BF16/baseline KV-cache, no rotation
+MODEL=/path/to/Qwen3-8B \
+DATA_ROOT=/home/relay/wangzijie/model \
+TASK=math500 KV_MODE=baseline TP_SIZE=2 GPUS=4,5 \
+RUN_DIR=rotation/qwen3-8B/baseline_math500 \
+bash rotation/qwen3-8B/eval_benchmark.sh
+```
+
+### Optional: run the Table-9-style serving throughput benchmark
+
+`rotation/bench_serving_throughput.sh` launches SGLang and runs the paper's
+representative end-to-end workload by default: 32 concurrent requests, 8192
+input tokens, and 1024 output tokens. It compares:
+
+- `baseline`: BF16/auto KV cache, FA3 prefill, Triton decode.
+- `baseline_fa3`: BF16/auto KV cache, FA3 prefill, FA3 decode.
+- `oscar`: INT2 KV cache with OSCAR rotations, FA3 prefill, Triton decode.
+
+```bash
+MODEL=/path/to/Qwen3-8B \
+ROT_DIR=rotation/qwen3-8B/GPQA/seq30000_prompt<N>_group128/rotations \
+TP_SIZE=1 GPUS=0 \
+bash rotation/qwen3-8B/bench_serving_throughput.sh
+```
+
+The script writes per-mode logs plus `summary.tsv` and `summary.jsonl` under
+`<rotation_parent>/_throughput_e2e_<timestamp>/`. For a more stable pressure
+test, keep `CONCURRENCY=32` and increase `NUM_PROMPTS`, e.g.
+`NUM_PROMPTS=128`. By default the server is launched with prefix/radix cache
+disabled, `MAX_RUNNING=1`, `CUDA_GRAPH_MAX_BS=1`, OSCAR HP-prefix pool set to
+`SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS=8192`, and the benchmark runner sends
+`--flush-cache`. Warmup defaults to about 100k tokens; with the default
+8192-token input and bench_serving's 32-token warmup output cap, this is 13
+warmup requests. Override with `DISABLE_RADIX_CACHE=0`, `FLUSH_CACHE=0`,
+`MAX_RUNNING=...`, `CUDA_GRAPH_MAX_BS=...`,
+`SGLANG_MIXED_KV_HP_PREFIX_POOL_TOKENS=...`, `WARMUP_TOKENS=...`, or
+`WARMUP_REQUESTS=...` as needed. To run only one mode:
+
+```bash
+MODES=baseline_fa3 MODEL=/path/to/Qwen3-8B TP_SIZE=1 GPUS=0 \
+bash rotation/qwen3-8B/bench_serving_throughput.sh
+```
+
 ## All configured models
 
 | Folder | HF model | TP (dump) | TP (eval) | Notes |
