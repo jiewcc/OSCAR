@@ -859,9 +859,12 @@ def _compile_decode(
     max_splits: int,
     cache_size: int,
     max_tiles_per_split: int,
+    att_out_stride: tuple,
+    att_lse_stride: tuple,
 ):
     key = (head_dim, block_n, kv_group_num, batch, head_num, kv_heads,
-           max_splits, cache_size, max_tiles_per_split)
+           max_splits, cache_size, max_tiles_per_split,
+           att_out_stride, att_lse_stride)
     if key in _compiled_decode_kernels:
         return _compiled_decode_kernels[key]
 
@@ -955,12 +958,12 @@ def _compile_decode(
     fake_att = cute.runtime.make_fake_tensor(
         cutlass.Float32,
         (batch, head_num, max_splits, head_dim),
-        (head_num * max_splits * head_dim, max_splits * head_dim, head_dim, 1),
+        att_out_stride,
         memspace=cute.AddressSpace.gmem, assumed_align=16,
     )
     fake_lse = cute.runtime.make_fake_tensor(
         cutlass.Float32, (batch, head_num, max_splits),
-        (head_num * max_splits, max_splits, 1),
+        att_lse_stride,
         memspace=cute.AddressSpace.gmem, assumed_align=16,
     )
     fake_stream = cuda.CUstream(0)
@@ -1031,6 +1034,8 @@ def cutedsl_decode_attention_fwd_int2(
     kv_group_num = head_num // kv_heads
     cache_size = k_buffer.shape[0]
     block_n = DECODE_BLOCK_N
+    att_out_stride = tuple(att_out.stride())
+    att_lse_stride = tuple(att_lse.stride())
 
     # Bound the compiled outer kv-tile loop. The kernel iterates this many
     # times unconditionally and masks each tile dynamically against the
@@ -1057,6 +1062,8 @@ def cutedsl_decode_attention_fwd_int2(
         head_dim, block_n, kv_group_num,
         batch, head_num, kv_heads, max_kv_splits, cache_size,
         max_tiles,
+        att_out_stride,
+        att_lse_stride,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
