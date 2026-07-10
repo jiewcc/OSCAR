@@ -338,6 +338,7 @@ def _define_decode_kernel(
     packed_bytes_per_loader: cutlass.Constexpr[int] = (
         packed_bytes_per_tile + _LOADER_THREADS - 1
     ) // _LOADER_THREADS
+    loader_lanes_per_token: cutlass.Constexpr[int] = _LOADER_THREADS // block_n
 
     @cute.kernel
     def kernel(
@@ -508,47 +509,52 @@ def _define_decode_kernel(
             # byte becomes four BF16 values in the quarter-interleaved OSCAR
             # layout: d4, d4+32, d4+64, d4+96.
             if is_loader:
+                # BLOCK_N=64 maps exactly two producer lanes to one token;
+                # each lane owns a contiguous 16-byte half-row.  Hoist the
+                # gathered position and scale/zero metadata out of the byte
+                # loop instead of reloading the same five shared values 16x.
+                row = loader_tid // loader_lanes_per_token
+                d4_base = (
+                    loader_tid % loader_lanes_per_token
+                ) * packed_bytes_per_loader
+                logical_kv = tile_start + row
+                valid_token = logical_kv < split_stop
+                kv_pos = sKvPos[row]
+                ks = sKScale[row]
+                kz = sKZero[row]
+                vs = sVScale[row]
+                vz = sVZero[row]
+
                 for j in cutlass.range_constexpr(packed_bytes_per_loader):
-                    linear_byte = loader_tid * packed_bytes_per_loader + j
-                    if linear_byte < packed_bytes_per_tile:
-                        row = linear_byte // quarter_dim
-                        d4 = linear_byte % quarter_dim
-                        logical_kv = tile_start + row
-                        valid_token = logical_kv < split_stop
+                    d4 = d4_base + j
+                    kp = cutlass.Uint8(0)
+                    vp = cutlass.Uint8(0)
+                    if valid_token:
+                        kp = K_packed[kv_pos, cur_kv_head, d4]
+                        vp = V_packed[kv_pos, cur_kv_head, d4]
 
-                        kp = cutlass.Uint8(0)
-                        vp = cutlass.Uint8(0)
-                        if valid_token:
-                            kv_pos = sKvPos[row]
-                            kp = K_packed[kv_pos, cur_kv_head, d4]
-                            vp = V_packed[kv_pos, cur_kv_head, d4]
+                    kp_i = cutlass.Int32(kp)
+                    vp_i = cutlass.Int32(vp)
 
-                        kp_i = cutlass.Int32(kp)
-                        vp_i = cutlass.Int32(vp)
-                        ks = sKScale[row]
-                        kz = sKZero[row]
-                        vs = sVScale[row]
-                        vz = sVZero[row]
+                    k0 = (cutlass.Float32(kp_i & 0x03) - kz) * ks
+                    k1 = (cutlass.Float32((kp_i >> 2) & 0x03) - kz) * ks
+                    k2 = (cutlass.Float32((kp_i >> 4) & 0x03) - kz) * ks
+                    k3 = (cutlass.Float32((kp_i >> 6) & 0x03) - kz) * ks
+                    v0 = (cutlass.Float32(vp_i & 0x03) - vz) * vs
+                    v1 = (cutlass.Float32((vp_i >> 2) & 0x03) - vz) * vs
+                    v2 = (cutlass.Float32((vp_i >> 4) & 0x03) - vz) * vs
+                    v3 = (cutlass.Float32((vp_i >> 6) & 0x03) - vz) * vs
 
-                        k0 = (cutlass.Float32(kp_i & 0x03) - kz) * ks
-                        k1 = (cutlass.Float32((kp_i >> 2) & 0x03) - kz) * ks
-                        k2 = (cutlass.Float32((kp_i >> 4) & 0x03) - kz) * ks
-                        k3 = (cutlass.Float32((kp_i >> 6) & 0x03) - kz) * ks
-                        v0 = (cutlass.Float32(vp_i & 0x03) - vz) * vs
-                        v1 = (cutlass.Float32((vp_i >> 2) & 0x03) - vz) * vs
-                        v2 = (cutlass.Float32((vp_i >> 4) & 0x03) - vz) * vs
-                        v3 = (cutlass.Float32((vp_i >> 6) & 0x03) - vz) * vs
-
-                        sK_mma[row, d4, 0] = cutlass.BFloat16(k0)
-                        sK_mma[row, d4 + quarter_dim, 0] = cutlass.BFloat16(k1)
-                        sK_mma[row, d4 + 2 * quarter_dim, 0] = cutlass.BFloat16(k2)
-                        sK_mma[row, d4 + 3 * quarter_dim, 0] = cutlass.BFloat16(k3)
-                        # PV is P[M,K=token] * V[K=token,N=dim], hence V is
-                        # stored as logical (dim, token) for WGMMA operand B.
-                        sV_mma[d4, row, 0] = cutlass.BFloat16(v0)
-                        sV_mma[d4 + quarter_dim, row, 0] = cutlass.BFloat16(v1)
-                        sV_mma[d4 + 2 * quarter_dim, row, 0] = cutlass.BFloat16(v2)
-                        sV_mma[d4 + 3 * quarter_dim, row, 0] = cutlass.BFloat16(v3)
+                    sK_mma[row, d4, 0] = cutlass.BFloat16(k0)
+                    sK_mma[row, d4 + quarter_dim, 0] = cutlass.BFloat16(k1)
+                    sK_mma[row, d4 + 2 * quarter_dim, 0] = cutlass.BFloat16(k2)
+                    sK_mma[row, d4 + 3 * quarter_dim, 0] = cutlass.BFloat16(k3)
+                    # PV is P[M,K=token] * V[K=token,N=dim], hence V is
+                    # stored as logical (dim, token) for WGMMA operand B.
+                    sV_mma[d4, row, 0] = cutlass.BFloat16(v0)
+                    sV_mma[d4 + quarter_dim, row, 0] = cutlass.BFloat16(v1)
+                    sV_mma[d4 + 2 * quarter_dim, row, 0] = cutlass.BFloat16(v2)
+                    sV_mma[d4 + 3 * quarter_dim, row, 0] = cutlass.BFloat16(v3)
                 cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.barrier()
 
