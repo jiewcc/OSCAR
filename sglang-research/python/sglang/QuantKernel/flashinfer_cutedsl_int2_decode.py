@@ -12,10 +12,10 @@ contract used by SGLang decode attention:
 * write one normalized output and LSE per split for the existing stage-2
   reducer.
 
-The block is warp-group specialized on Hopper: the first warp group gathers
-and dequantizes K/V, while the second warp group consumes the BF16 tiles with
-SM90 WGMMA.  WGMMA has a fixed 64-row atom, so the one (MHA) or four (GQA)
-query rows occupy the leading rows of the tile and padded rows are discarded.
+Each block uses one Hopper warp group to gather and dequantize K/V and then
+consume the BF16 tiles with SM90 WGMMA.  WGMMA has a fixed 64-row atom, so the
+one (MHA) or four (GQA) query rows occupy the leading rows of the tile and
+padded rows are discarded.
 
 Unlike the legacy kernel, the KV tile loop is a true runtime ``while`` loop.
 It is bounded by the actual token range assigned to the split, never by a
@@ -59,7 +59,7 @@ _LOG2_E = 1.4426950408889634
 
 _LOADER_THREADS = 128
 _CONSUMER_THREADS = 128
-_NUM_THREADS = _LOADER_THREADS + _CONSUMER_THREADS
+_NUM_THREADS = _CONSUMER_THREADS
 
 _compiled_decode_kernels: Dict[Tuple, object] = {}
 
@@ -366,9 +366,9 @@ def _define_decode_kernel(
         cur_batch, cur_kv_head, split_kv_id = cute.arch.block_idx()
 
         is_loader = tidx < _LOADER_THREADS
-        is_consumer = tidx >= _LOADER_THREADS
+        is_consumer = tidx < _CONSUMER_THREADS
         loader_tid = tidx
-        consumer_tid = tidx - _LOADER_THREADS
+        consumer_tid = tidx
         q_head_base = cur_kv_head * kv_group_num
 
         kv_start_idx = cutlass.Int32(kv_indptr[cur_batch])
@@ -412,8 +412,8 @@ def _define_decode_kernel(
             swizzle=v_smem_layout_staged.inner,
         )
 
-        # WGMMA descriptors and register fragments.  ``tidx % 128`` gives the
-        # lane inside either warp group; only the consumer group issues MMA.
+        # WGMMA descriptors and register fragments.  The same warp group first
+        # materializes K/V and then issues the tensor-core work.
         mma_tid = tidx % _CONSUMER_THREADS
         qk_thr_mma = qk_tiled_mma.get_slice(mma_tid)
         pv_thr_mma = pv_tiled_mma.get_slice(mma_tid)
@@ -447,9 +447,8 @@ def _define_decode_kernel(
         if is_consumer & (consumer_tid < head_dim):
             for qid in cutlass.range_constexpr(kv_group_num):
                 sQ[qid, consumer_tid, 0] = Q[cur_batch, q_head_base + qid, consumer_tid]
-        # WGMMA always reads an m64 tile.  The producer group is idle during
-        # this one-time Q load, so let it clear padded MHA/GQA rows in parallel
-        # with the consumer loading the one/four real query rows.
+        # WGMMA always reads an m64 tile, so clear the padded MHA/GQA rows after
+        # loading the one/four real query rows.
         if is_loader & (loader_tid < head_dim):
             for qid in cutlass.range_constexpr(kv_group_num, _WGMMA_M):
                 sQ[qid, loader_tid, 0] = cutlass.BFloat16(0.0)
@@ -462,7 +461,7 @@ def _define_decode_kernel(
         tile_start = split_start
         while tile_start < split_stop:
             # -------------------------------------------------------------
-            # Producer warp group: token gather and fused dequantization.
+            # Warp group phase 1: token gather and fused dequantization.
             # -------------------------------------------------------------
             # Every producer lane owns a fixed group of packed bytes.  Each
             # byte becomes four BF16 values in the quarter-interleaved OSCAR
@@ -547,7 +546,7 @@ def _define_decode_kernel(
             cute.arch.barrier()
 
             # -------------------------------------------------------------
-            # Consumer warp group: WGMMA QK, online softmax, then WGMMA PV.
+            # Warp group phase 2: WGMMA QK, online softmax, then WGMMA PV.
             # -------------------------------------------------------------
             if is_consumer:
                 acc_qk = qk_thr_mma.make_fragment_C(qk_acc_shape)
@@ -595,8 +594,7 @@ def _define_decode_kernel(
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.wait_group(0)
 
-            # Producer must not overwrite the shared operands until every
-            # consumer has completed PV.
+            # Do not overwrite the shared operands until PV has completed.
             cute.arch.barrier()
             tile_start = tile_start + block_n
 
