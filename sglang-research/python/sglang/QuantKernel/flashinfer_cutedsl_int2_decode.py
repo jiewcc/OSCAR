@@ -412,25 +412,6 @@ def _define_decode_kernel(
             swizzle=v_smem_layout_staged.inner,
         )
 
-        # The first half-warp of the producer resolves each token index and
-        # scale pair once.  All packed-byte loader lanes reuse these values,
-        # mirroring FlashInfer's page-offset prefetch/reuse strategy.
-        sKvPos = smem.allocate_tensor(
-            cutlass.Int32, cute.make_layout((block_n,), stride=(1,)), 16
-        )
-        sKScale = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((block_n,), stride=(1,)), 16
-        )
-        sKZero = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((block_n,), stride=(1,)), 16
-        )
-        sVScale = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((block_n,), stride=(1,)), 16
-        )
-        sVZero = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((block_n,), stride=(1,)), 16
-        )
-
         # WGMMA descriptors and register fragments.  ``tidx % 128`` gives the
         # lane inside either warp group; only the consumer group issues MMA.
         mma_tid = tidx % _CONSUMER_THREADS
@@ -481,49 +462,34 @@ def _define_decode_kernel(
         tile_start = split_start
         while tile_start < split_stop:
             # -------------------------------------------------------------
-            # Producer warp group: token gather and scale/zero prefetch.
+            # Producer warp group: token gather and fused dequantization.
             # -------------------------------------------------------------
-            if is_loader & (loader_tid < block_n):
-                logical_kv = tile_start + loader_tid
-                valid_token = logical_kv < split_stop
-                kv_pos = cutlass.Int32(0)
-                k_scale = cutlass.Float32(0.0)
-                k_zero = cutlass.Float32(0.0)
-                v_scale = cutlass.Float32(0.0)
-                v_zero = cutlass.Float32(0.0)
-                if valid_token:
-                    kv_pos = cutlass.Int32(kv_indices[kv_start_idx + logical_kv])
-                    k_scale = cutlass.Float32(K_sz[kv_pos, cur_kv_head, 0])
-                    k_zero = cutlass.Float32(K_sz[kv_pos, cur_kv_head, 1])
-                    v_scale = cutlass.Float32(V_sz[kv_pos, cur_kv_head, 0])
-                    v_zero = cutlass.Float32(V_sz[kv_pos, cur_kv_head, 1])
-
-                sKvPos[loader_tid] = kv_pos
-                sKScale[loader_tid] = k_scale
-                sKZero[loader_tid] = k_zero
-                sVScale[loader_tid] = v_scale
-                sVZero[loader_tid] = v_zero
-            cute.arch.barrier()
-
             # Every producer lane owns a fixed group of packed bytes.  Each
             # byte becomes four BF16 values in the quarter-interleaved OSCAR
             # layout: d4, d4+32, d4+64, d4+96.
             if is_loader:
                 # BLOCK_N=64 maps exactly two producer lanes to one token;
-                # each lane owns a contiguous 16-byte half-row.  Hoist the
-                # gathered position and scale/zero metadata out of the byte
-                # loop instead of reloading the same five shared values 16x.
+                # each lane owns a contiguous 16-byte half-row.  Resolve the
+                # indirect position and dequant metadata once per lane.  The
+                # duplicate loads hit the same L1 line for the paired lane and
+                # avoid a CTA-wide metadata hand-off barrier on every tile.
                 row = loader_tid // loader_lanes_per_token
                 d4_base = (
                     loader_tid % loader_lanes_per_token
                 ) * packed_bytes_per_loader
                 logical_kv = tile_start + row
                 valid_token = logical_kv < split_stop
-                kv_pos = sKvPos[row]
-                ks = sKScale[row]
-                kz = sKZero[row]
-                vs = sVScale[row]
-                vz = sVZero[row]
+                kv_pos = cutlass.Int32(0)
+                ks = cutlass.Float32(0.0)
+                kz = cutlass.Float32(0.0)
+                vs = cutlass.Float32(0.0)
+                vz = cutlass.Float32(0.0)
+                if valid_token:
+                    kv_pos = cutlass.Int32(kv_indices[kv_start_idx + logical_kv])
+                    ks = cutlass.Float32(K_sz[kv_pos, cur_kv_head, 0])
+                    kz = cutlass.Float32(K_sz[kv_pos, cur_kv_head, 1])
+                    vs = cutlass.Float32(V_sz[kv_pos, cur_kv_head, 0])
+                    vz = cutlass.Float32(V_sz[kv_pos, cur_kv_head, 1])
 
                 for j in cutlass.range_constexpr(packed_bytes_per_loader):
                     d4 = d4_base + j
@@ -691,14 +657,12 @@ def _compile_decode(
         kv_group_num=kv_group_num,
     )
 
-    # Three single-stage WGMMA operands plus gather/dequant metadata.  The
-    # 1024-byte allowance covers allocator padding at swizzled-tensor borders.
+    # Three single-stage WGMMA operands.  The 1024-byte allowance covers
+    # allocator padding at swizzled-tensor borders.
     smem_bytes = (
         _WGMMA_M * head_dim * 2
         + block_n * head_dim * 2
         + head_dim * block_n * 2
-        + block_n * 4
-        + 4 * block_n * 4
         + 1024
     )
 
