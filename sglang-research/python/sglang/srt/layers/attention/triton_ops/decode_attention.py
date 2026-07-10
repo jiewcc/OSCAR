@@ -877,12 +877,19 @@ def decode_attention_fwd_quantized(
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
     # ``SGLANG_INT2_BACKEND`` re-routes the stage-1 kernel through an alternate
-    # implementation. Supported: cutedsl (CuTeDSL SIMT), cuda (CUDA wmma),
-    # cuda-wgmma (CUDA wgmma). All three map q-head -> kv-head via
+    # implementation. Supported: cutedsl (legacy CuTeDSL SIMT),
+    # flashinfer-cutedsl (FlashInfer-derived CuTeDSL with fused dequant),
+    # cuda (CUDA wmma), and cuda-wgmma (CUDA wgmma). All implementations map
+    # q-head -> kv-head via
     # ``cur_kv_head = cur_head // kv_group_num`` so they work for MHA + GQA.
     backend_env = os.environ.get("SGLANG_INT2_BACKEND", "").lower()
     if (
-        backend_env in ("cutedsl", "cuda", "cuda-wgmma")
+        backend_env in (
+            "cutedsl",
+            "flashinfer-cutedsl",
+            "cuda",
+            "cuda-wgmma",
+        )
         and logit_cap == 0.0
         and xai_temperature_len <= 0
         and sinks is None
@@ -894,6 +901,13 @@ def decode_attention_fwd_quantized(
                     cutedsl_decode_attention_fwd_int2 as _alt_fn,
                 )
                 _alt_label = "CuteDSL"
+            elif backend_env == "flashinfer-cutedsl":
+                from sglang.QuantKernel.flashinfer_cutedsl_int2_decode import (
+                    can_use_flashinfer_cutedsl_decode as _can_use,
+                    flashinfer_cutedsl_decode_attention_fwd_int2 as _alt_fn,
+                )
+
+                _alt_label = "FlashInfer-derived CuteDSL"
             elif backend_env == "cuda":
                 from sglang.QuantKernel.cutedsl_int2_kv import (
                     can_use_cuda_decode as _can_use,
@@ -2556,15 +2570,21 @@ def decode_attention_fwd_int2_unified(
     if quant_kv_indices.numel() > 0:
         # ``SGLANG_INT2_BACKEND`` reroutes the int2 portion of the unified
         # path through an alternate kernel. Supported values:
-        #   cutedsl    — CuTeDSL SIMT kernel
-        #   cuda       — CUDA C++ wmma kernel
-        #   cuda-wgmma — CUDA C++ wgmma kernel
+        #   cutedsl            — legacy CuTeDSL SIMT kernel
+        #   flashinfer-cutedsl — FlashInfer-derived CuTeDSL fused-dequant kernel
+        #   cuda               — CUDA C++ wmma kernel
+        #   cuda-wgmma         — CUDA C++ wgmma kernel
         # logit_cap / xai_temperature_len must be defaults (none of the
         # alternate kernels implement them).
         used_alt = False
         backend_env = os.environ.get("SGLANG_INT2_BACKEND", "").lower()
         if (
-            backend_env in ("cutedsl", "cuda", "cuda-wgmma")
+            backend_env in (
+                "cutedsl",
+                "flashinfer-cutedsl",
+                "cuda",
+                "cuda-wgmma",
+            )
             and logit_cap == 0.0
             and xai_temperature_len <= 0
         ):
@@ -2575,6 +2595,13 @@ def decode_attention_fwd_int2_unified(
                         cutedsl_decode_attention_fwd_int2 as _alt_fn,
                     )
                     alt_label = "CuteDSL"
+                elif backend_env == "flashinfer-cutedsl":
+                    from sglang.QuantKernel.flashinfer_cutedsl_int2_decode import (
+                        can_use_flashinfer_cutedsl_decode as _can_use,
+                        flashinfer_cutedsl_decode_attention_fwd_int2 as _alt_fn,
+                    )
+
+                    alt_label = "FlashInfer-derived CuteDSL"
                 elif backend_env == "cuda":
                     from sglang.QuantKernel.cutedsl_int2_kv import (
                         can_use_cuda_decode as _can_use,
