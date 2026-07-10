@@ -16,6 +16,9 @@ import triton
 from sglang.QuantKernel.flashinfer_cutedsl_int2_decode import (
     flashinfer_cutedsl_decode_attention_fwd_int2,
 )
+from sglang.QuantKernel.flashinfer_cutedsl_int2_decode_transposed import (
+    flashinfer_cutedsl_decode_attention_fwd_int2_transposed,
+)
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _decode_att_m_fwd_quant_int2,
     _decode_grouped_att_m_fwd_quant_int2,
@@ -51,11 +54,13 @@ def _auto_splits(seq_len: int) -> int:
     return 4 if seq_len <= 4096 else 8
 
 
-def make_case(batch: int, seq_len: int, gqa: bool) -> Stage1Case:
+def make_case(
+    batch: int, seq_len: int, gqa: bool, max_splits_override: int | None = None
+) -> Stage1Case:
     device = "cuda"
     q_heads, kv_heads = (32, 8) if gqa else (8, 8)
     head_dim = 128
-    max_splits = _auto_splits(seq_len)
+    max_splits = max_splits_override or _auto_splits(seq_len)
     num_tokens = batch * seq_len
 
     torch.manual_seed(batch * 1000003 + seq_len + int(gqa))
@@ -143,6 +148,23 @@ def run_cutedsl(case: Stage1Case) -> None:
     )
 
 
+def run_transposed(case: Stage1Case) -> None:
+    flashinfer_cutedsl_decode_attention_fwd_int2_transposed(
+        case.q,
+        case.k,
+        case.v,
+        case.k_sz,
+        case.v_sz,
+        case.dsl_out,
+        case.dsl_lse,
+        case.kv_indptr,
+        case.kv_indices,
+        case.splits,
+        case.max_splits,
+        case.sm_scale,
+    )
+
+
 def bench(fn, warmup: int, rep: int) -> float:
     fn()
     torch.cuda.synchronize()
@@ -158,22 +180,29 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=50)
-    parser.add_argument("--profile", choices=("triton", "cutedsl"), default=None)
+    parser.add_argument("--splits", type=int, default=None)
+    parser.add_argument(
+        "--profile", choices=("triton", "cutedsl", "transposed"), default=None
+    )
     args = parser.parse_args()
 
     if args.profile is not None and (len(args.batches) != 1 or len(args.seq_lens) != 1):
         parser.error("--profile requires one batch and one sequence length")
 
-    print("mode,batch,seq,splits,triton_ms,cutedsl_ms,tri_over_dsl")
+    print(
+        "mode,batch,seq,splits,triton_ms,cutedsl_ms,transposed_ms,"
+        "tri_over_dsl,tri_over_transposed"
+    )
     for batch in args.batches:
         for seq_len in args.seq_lens:
-            case = make_case(batch, seq_len, args.gqa)
+            case = make_case(batch, seq_len, args.gqa, args.splits)
             if args.profile is not None:
-                fn = (
-                    (lambda: run_triton(case, args.gqa))
-                    if args.profile == "triton"
-                    else (lambda: run_cutedsl(case))
-                )
+                if args.profile == "triton":
+                    fn = lambda: run_triton(case, args.gqa)
+                elif args.profile == "cutedsl":
+                    fn = lambda: run_cutedsl(case)
+                else:
+                    fn = lambda: run_transposed(case)
                 fn()
                 torch.cuda.synchronize()
                 torch.cuda.nvtx.range_push("profile")
@@ -184,10 +213,12 @@ def main() -> None:
 
             tri_ms = bench(lambda: run_triton(case, args.gqa), args.warmup, args.rep)
             dsl_ms = bench(lambda: run_cutedsl(case), args.warmup, args.rep)
+            transposed_ms = bench(lambda: run_transposed(case), args.warmup, args.rep)
             mode = "gqa" if args.gqa else "mha"
             print(
                 f"{mode},{batch},{seq_len},{case.max_splits},"
-                f"{tri_ms:.6f},{dsl_ms:.6f},{tri_ms / dsl_ms:.4f}"
+                f"{tri_ms:.6f},{dsl_ms:.6f},{transposed_ms:.6f},"
+                f"{tri_ms / dsl_ms:.4f},{tri_ms / transposed_ms:.4f}"
             )
 
 

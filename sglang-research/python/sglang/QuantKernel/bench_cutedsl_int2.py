@@ -3,9 +3,9 @@
 Defaults match the validated Qwen3-4B Thinking eval config
 (``head_dim=128``, ``group_size==head_dim`` per-row scale/zero).
 
-Decode comparison keeps Triton, the legacy SIMT CuTeDSL kernel, and the
-FlashInfer-derived fused-dequant CuTeDSL kernel in the same run. Every timing
-includes both stage 1 and split-KV reduction.
+Decode comparison keeps Triton, the legacy SIMT CuTeDSL kernel, the original
+FlashInfer-derived fused-dequant kernel, and the transposed-n8 candidate in the
+same run. Every timing includes both stage 1 and split-KV reduction.
 
 Exit code 0 on speedup >= ``--assert-speedup``; non-zero otherwise.
 """
@@ -37,16 +37,19 @@ from sglang.QuantKernel.cutedsl_int2_kv import (
 TRITON_BACKEND = "triton"
 LEGACY_CUTEDSL_BACKEND = "cutedsl"
 FLASHINFER_CUTEDSL_BACKEND = "flashinfer-cutedsl"
+TRANSPOSED_CUTEDSL_BACKEND = "flashinfer-cutedsl-transposed"
 COMPARE_BACKENDS = (
     TRITON_BACKEND,
     LEGACY_CUTEDSL_BACKEND,
     FLASHINFER_CUTEDSL_BACKEND,
+    TRANSPOSED_CUTEDSL_BACKEND,
 )
 ALL_BACKENDS = COMPARE_BACKENDS + ("cuda", "cuda-wgmma")
 BACKEND_LABELS = {
     TRITON_BACKEND: "Triton INT2",
     LEGACY_CUTEDSL_BACKEND: "Legacy CuteDSL",
     FLASHINFER_CUTEDSL_BACKEND: "FI-derived CuteDSL",
+    TRANSPOSED_CUTEDSL_BACKEND: "Transposed n8 CuteDSL",
     "cuda": "CUDA C++ wmma",
     "cuda-wgmma": "CUDA C++ wgmma",
 }
@@ -106,6 +109,12 @@ def _get_stage1_fn(backend: str):
         )
 
         return flashinfer_cutedsl_decode_attention_fwd_int2
+    if backend == TRANSPOSED_CUTEDSL_BACKEND:
+        from sglang.QuantKernel.flashinfer_cutedsl_int2_decode_transposed import (
+            flashinfer_cutedsl_decode_attention_fwd_int2_transposed,
+        )
+
+        return flashinfer_cutedsl_decode_attention_fwd_int2_transposed
     if backend == "cuda":
         return cuda_decode_attention_fwd_int2
     if backend == "cuda-wgmma":
@@ -558,24 +567,23 @@ def _make_correctness_case(
     }
 
 
-def _run_flashinfer_unified_contract_case(
+def _run_unified_contract_case(
     *,
+    backend: str,
     head_dim: int,
     out_atol: float,
     out_rtol: float,
     lse_atol: float,
     lse_rtol: float,
 ):
-    """Exercise the new wrapper with production mixed-KV metadata/scratch.
+    """Exercise a fused wrapper with production mixed-KV metadata/scratch.
 
-    This intentionally imports and calls the FlashInfer-derived wrapper
-    directly.  It cannot pass through the environment dispatch or its Triton
-    fallback, so a successful comparison proves that the int64-index and
-    non-contiguous unified-scratch specialization itself executed.
+    This calls the selected wrapper directly. It cannot pass through the
+    environment dispatch or its Triton fallback, so a successful comparison
+    proves that the int64-index and non-contiguous unified-scratch
+    specialization itself executed.
     """
-    from sglang.QuantKernel.flashinfer_cutedsl_int2_decode import (
-        flashinfer_cutedsl_decode_attention_fwd_int2,
-    )
+    stage1_fn = _get_stage1_fn(backend)
 
     q_heads, kv_heads = 32, 8
     seq_lens, runtime_splits, max_splits = (65, 37), (3, 2), 4
@@ -612,7 +620,7 @@ def _run_flashinfer_unified_contract_case(
     )
 
     def run_direct_wrapper():
-        flashinfer_cutedsl_decode_attention_fwd_int2(
+        stage1_fn(
             case["q"],
             case["k_packed"],
             case["v_packed"],
@@ -814,10 +822,16 @@ def _test_correctness(
                 f"{'PASS' if passed else 'FAIL':>7s}"
             )
 
-    if FLASHINFER_CUTEDSL_BACKEND in backends:
+    for backend in (
+        FLASHINFER_CUTEDSL_BACKEND,
+        TRANSPOSED_CUTEDSL_BACKEND,
+    ):
+        if backend not in backends:
+            continue
         try:
             label, cos, out_max_abs, lse_max_abs, close = (
-                _run_flashinfer_unified_contract_case(
+                _run_unified_contract_case(
+                    backend=backend,
                     head_dim=head_dim,
                     out_atol=out_atol,
                     out_rtol=out_rtol,
@@ -829,7 +843,7 @@ def _test_correctness(
             min_cos = min(min_cos, cos if math.isfinite(cos) else -1.0)
             failed |= not passed
             print(
-                f"{label:<53s} {BACKEND_LABELS[FLASHINFER_CUTEDSL_BACKEND]:<20s} "
+                f"{label:<53s} {BACKEND_LABELS[backend]:<20s} "
                 f"{cos:>9.6f} {out_max_abs:>10.3e} {lse_max_abs:>10.3e} "
                 f"{'PASS' if passed else 'FAIL':>7s}"
             )
@@ -838,7 +852,7 @@ def _test_correctness(
             min_cos = min(min_cos, -1.0)
             print(
                 f"{'int64+sliced-unified direct wrapper':<53s} "
-                f"{BACKEND_LABELS[FLASHINFER_CUTEDSL_BACKEND]:<20s} "
+                f"{BACKEND_LABELS[backend]:<20s} "
                 f"run error: {type(exc).__name__}: {exc}"
             )
 
@@ -880,7 +894,7 @@ def main():
         default="compare",
         help=(
             "Single optimized backend (automatically paired with Triton), "
-            "'compare' for Triton + legacy CuteDSL + FI-derived CuteDSL, or "
+            "'compare' for Triton + legacy + FI-derived baseline + transposed, or "
             "'all' to additionally include CUDA wmma/wgmma."
         ),
     )
@@ -1020,8 +1034,8 @@ def main():
         if not min_speedup:
             p.error("--assert-speedup requires an optimized backend")
         gate_backend = (
-            FLASHINFER_CUTEDSL_BACKEND
-            if FLASHINFER_CUTEDSL_BACKEND in min_speedup
+            TRANSPOSED_CUTEDSL_BACKEND
+            if TRANSPOSED_CUTEDSL_BACKEND in min_speedup
             else next(reversed(min_speedup))
         )
         measured = min_speedup[gate_backend]

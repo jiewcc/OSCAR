@@ -743,14 +743,24 @@ def flashinfer_cutedsl_decode_attention_fwd_int2_transposed(
         raise ValueError("kv_indices must be contiguous")
     if num_kv_splits.dtype != torch.int32 or not num_kv_splits.is_contiguous():
         raise TypeError("num_kv_splits must be contiguous torch.int32")
+    if kv_indptr.numel() < batch + 1 or num_kv_splits.numel() < batch:
+        raise ValueError("KV metadata is smaller than the query batch")
     if att_out.dtype != torch.float32 or att_lse.dtype != torch.float32:
         raise TypeError("att_out and att_lse must be torch.float32")
-    if att_out.shape != (batch, q_heads, max_kv_splits, head_dim):
-        raise ValueError("att_out shape does not match the stage-1 contract")
-    if att_lse.shape != (batch, q_heads, max_kv_splits):
-        raise ValueError("att_lse shape does not match the stage-1 contract")
+    if att_out.ndim != 4 or att_lse.ndim != 3:
+        raise ValueError("att_out must be 4D and att_lse must be 3D")
+    if att_out.shape[0] < batch or att_lse.shape[0] < batch:
+        raise ValueError("attention scratch batch dimension is too small")
+    if att_out.shape[1] != q_heads or att_lse.shape[1] != q_heads:
+        raise ValueError("attention scratch head dimension does not match Q")
+    if att_out.shape[2] != max_kv_splits or att_lse.shape[2] != max_kv_splits:
+        raise ValueError(
+            "attention scratch split dimension does not match max_kv_splits"
+        )
+    if att_out.shape[3] != head_dim:
+        raise ValueError("att_out head dimension does not match Q")
     if att_out.stride(-1) != 1 or att_lse.stride(-1) != 1:
-        raise ValueError("scratch tensors require contiguous innermost dimensions")
+        raise ValueError("attention scratch requires a contiguous innermost dimension")
 
     tensors = (
         k_buffer,
