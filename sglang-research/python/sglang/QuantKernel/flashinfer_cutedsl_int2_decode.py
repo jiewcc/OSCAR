@@ -491,13 +491,35 @@ def _define_decode_kernel(
                     vs = cutlass.Float32(V_sz[kv_pos, cur_kv_head, 0])
                     vz = cutlass.Float32(V_sz[kv_pos, cur_kv_head, 1])
 
+                gK_packed = K_packed[kv_pos, cur_kv_head, None]
+                gV_packed = V_packed[kv_pos, cur_kv_head, None]
+                packed_lane = loader_tid % loader_lanes_per_token
+                gK_lane = cute.local_tile(
+                    gK_packed,
+                    (packed_bytes_per_loader,),
+                    (packed_lane,),
+                )
+                gV_lane = cute.local_tile(
+                    gV_packed,
+                    (packed_bytes_per_loader,),
+                    (packed_lane,),
+                )
+                rK_packed = cute.make_rmem_tensor(
+                    (packed_bytes_per_loader,), cutlass.Uint8
+                )
+                rV_packed = cute.make_rmem_tensor(
+                    (packed_bytes_per_loader,), cutlass.Uint8
+                )
+                rK_packed.fill(cutlass.Uint8(0))
+                rV_packed.fill(cutlass.Uint8(0))
+                if valid_token:
+                    cute.autovec_copy(gK_lane, rK_packed)
+                    cute.autovec_copy(gV_lane, rV_packed)
+
                 for j in cutlass.range_constexpr(packed_bytes_per_loader):
                     d4 = d4_base + j
-                    kp = cutlass.Uint8(0)
-                    vp = cutlass.Uint8(0)
-                    if valid_token:
-                        kp = K_packed[kv_pos, cur_kv_head, d4]
-                        vp = V_packed[kv_pos, cur_kv_head, d4]
+                    kp = rK_packed[j]
+                    vp = rV_packed[j]
 
                     kp_i = cutlass.Int32(kp)
                     vp_i = cutlass.Int32(vp)
