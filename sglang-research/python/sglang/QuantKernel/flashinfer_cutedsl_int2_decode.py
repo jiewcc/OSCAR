@@ -447,11 +447,6 @@ def _define_decode_kernel(
         if is_consumer & (consumer_tid < head_dim):
             for qid in cutlass.range_constexpr(kv_group_num):
                 sQ[qid, consumer_tid, 0] = Q[cur_batch, q_head_base + qid, consumer_tid]
-        # WGMMA always reads an m64 tile, so clear the padded MHA/GQA rows after
-        # loading the one/four real query rows.
-        if is_loader & (loader_tid < head_dim):
-            for qid in cutlass.range_constexpr(kv_group_num, _WGMMA_M):
-                sQ[qid, loader_tid, 0] = cutlass.BFloat16(0.0)
         # Generic shared stores become visible to the WGMMA async proxy.
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.barrier()
