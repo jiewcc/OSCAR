@@ -16,6 +16,9 @@ import triton
 from sglang.QuantKernel.flashinfer_cutedsl_int2_decode import (
     flashinfer_cutedsl_decode_attention_fwd_int2,
 )
+from sglang.QuantKernel.flashinfer_cutedsl_int2_decode_optimized import (
+    flashinfer_cutedsl_decode_attention_fwd_int2_optimized,
+)
 from sglang.QuantKernel.flashinfer_cutedsl_int2_decode_transposed import (
     flashinfer_cutedsl_decode_attention_fwd_int2_transposed,
 )
@@ -165,6 +168,23 @@ def run_transposed(case: Stage1Case) -> None:
     )
 
 
+def run_optimized(case: Stage1Case) -> None:
+    flashinfer_cutedsl_decode_attention_fwd_int2_optimized(
+        case.q,
+        case.k,
+        case.v,
+        case.k_sz,
+        case.v_sz,
+        case.dsl_out,
+        case.dsl_lse,
+        case.kv_indptr,
+        case.kv_indices,
+        case.splits,
+        case.max_splits,
+        case.sm_scale,
+    )
+
+
 def bench(fn, warmup: int, rep: int) -> float:
     fn()
     torch.cuda.synchronize()
@@ -182,7 +202,9 @@ def main() -> None:
     parser.add_argument("--rep", type=int, default=50)
     parser.add_argument("--splits", type=int, default=None)
     parser.add_argument(
-        "--profile", choices=("triton", "cutedsl", "transposed"), default=None
+        "--profile",
+        choices=("triton", "cutedsl", "transposed", "optimized"),
+        default=None,
     )
     args = parser.parse_args()
 
@@ -190,8 +212,8 @@ def main() -> None:
         parser.error("--profile requires one batch and one sequence length")
 
     print(
-        "mode,batch,seq,splits,triton_ms,cutedsl_ms,transposed_ms,"
-        "tri_over_dsl,tri_over_transposed"
+        "mode,batch,seq,splits,triton_ms,cutedsl_ms,transposed_ms,optimized_ms,"
+        "tri_over_dsl,tri_over_transposed,tri_over_optimized"
     )
     for batch in args.batches:
         for seq_len in args.seq_lens:
@@ -201,8 +223,10 @@ def main() -> None:
                     fn = lambda: run_triton(case, args.gqa)
                 elif args.profile == "cutedsl":
                     fn = lambda: run_cutedsl(case)
-                else:
+                elif args.profile == "transposed":
                     fn = lambda: run_transposed(case)
+                else:
+                    fn = lambda: run_optimized(case)
                 fn()
                 torch.cuda.synchronize()
                 torch.cuda.nvtx.range_push("profile")
@@ -214,11 +238,13 @@ def main() -> None:
             tri_ms = bench(lambda: run_triton(case, args.gqa), args.warmup, args.rep)
             dsl_ms = bench(lambda: run_cutedsl(case), args.warmup, args.rep)
             transposed_ms = bench(lambda: run_transposed(case), args.warmup, args.rep)
+            optimized_ms = bench(lambda: run_optimized(case), args.warmup, args.rep)
             mode = "gqa" if args.gqa else "mha"
             print(
                 f"{mode},{batch},{seq_len},{case.max_splits},"
                 f"{tri_ms:.6f},{dsl_ms:.6f},{transposed_ms:.6f},"
-                f"{tri_ms / dsl_ms:.4f},{tri_ms / transposed_ms:.4f}"
+                f"{optimized_ms:.6f},{tri_ms / dsl_ms:.4f},"
+                f"{tri_ms / transposed_ms:.4f},{tri_ms / optimized_ms:.4f}"
             )
 
 

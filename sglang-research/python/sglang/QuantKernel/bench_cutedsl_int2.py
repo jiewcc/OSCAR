@@ -4,8 +4,9 @@ Defaults match the validated Qwen3-4B Thinking eval config
 (``head_dim=128``, ``group_size==head_dim`` per-row scale/zero).
 
 Decode comparison keeps Triton, the legacy SIMT CuTeDSL kernel, the original
-FlashInfer-derived fused-dequant kernel, and the transposed-n8 candidate in the
-same run. Every timing includes both stage 1 and split-KV reduction.
+FlashInfer-derived fused-dequant kernel, and the optimized fully
+register-sourced kernel in the same run. Every timing includes both stage 1
+and split-KV reduction.
 
 Exit code 0 on speedup >= ``--assert-speedup``; non-zero otherwise.
 """
@@ -18,38 +19,37 @@ from typing import Dict, Sequence
 import torch
 import triton
 
+from sglang.QuantKernel.cutedsl_int2_kv import (
+    _launch_quantize_one,
+    _load_cuda_decode_extension,
+    cuda_decode_attention_fwd_int2,
+    cutedsl_decode_attention_fwd_int2,
+    get_cuda_invocation_counters,
+    reset_cuda_invocation_counters,
+)
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _decode_softmax_reducev_fwd,
     decode_attention_fwd_grouped_quant_int2,
     decode_attention_fwd_normal_quant_int2,
 )
 from sglang.srt.mem_cache.kv_quant_kernels import _launch_quantize_int2
-from sglang.QuantKernel.cutedsl_int2_kv import (
-    _launch_quantize_one,
-    cuda_decode_attention_fwd_int2,
-    cutedsl_decode_attention_fwd_int2,
-    _load_cuda_decode_extension,
-    get_cuda_invocation_counters,
-    reset_cuda_invocation_counters,
-)
-
 
 TRITON_BACKEND = "triton"
 LEGACY_CUTEDSL_BACKEND = "cutedsl"
+FLASHINFER_CUTEDSL_BASELINE_BACKEND = "flashinfer-cutedsl-baseline"
 FLASHINFER_CUTEDSL_BACKEND = "flashinfer-cutedsl"
-TRANSPOSED_CUTEDSL_BACKEND = "flashinfer-cutedsl-transposed"
 COMPARE_BACKENDS = (
     TRITON_BACKEND,
     LEGACY_CUTEDSL_BACKEND,
+    FLASHINFER_CUTEDSL_BASELINE_BACKEND,
     FLASHINFER_CUTEDSL_BACKEND,
-    TRANSPOSED_CUTEDSL_BACKEND,
 )
 ALL_BACKENDS = COMPARE_BACKENDS + ("cuda", "cuda-wgmma")
 BACKEND_LABELS = {
     TRITON_BACKEND: "Triton INT2",
     LEGACY_CUTEDSL_BACKEND: "Legacy CuteDSL",
-    FLASHINFER_CUTEDSL_BACKEND: "FI-derived CuteDSL",
-    TRANSPOSED_CUTEDSL_BACKEND: "Transposed n8 CuteDSL",
+    FLASHINFER_CUTEDSL_BASELINE_BACKEND: "FI-derived baseline",
+    FLASHINFER_CUTEDSL_BACKEND: "Optimized CuteDSL",
     "cuda": "CUDA C++ wmma",
     "cuda-wgmma": "CUDA C++ wgmma",
 }
@@ -59,6 +59,7 @@ BACKEND_LABELS = {
 _HAS_FLASHINFER = False
 try:
     import flashinfer  # noqa: F401
+
     _HAS_FLASHINFER = True
 except Exception:
     pass
@@ -82,7 +83,7 @@ def _expand_backend_selection(selection: str) -> tuple[str, ...]:
 
     A single optimized backend is always paired with Triton so its timing and
     accuracy have a reference from the same run. ``compare`` is the primary
-    three-way comparison requested by this benchmark; ``all`` additionally
+    four-way comparison requested by this benchmark; ``all`` additionally
     includes the two CUDA C++ experimental kernels already supported here.
     """
     if selection == "compare":
@@ -103,18 +104,18 @@ def _get_stage1_fn(backend: str):
     """
     if backend == LEGACY_CUTEDSL_BACKEND:
         return cutedsl_decode_attention_fwd_int2
-    if backend == FLASHINFER_CUTEDSL_BACKEND:
+    if backend == FLASHINFER_CUTEDSL_BASELINE_BACKEND:
         from sglang.QuantKernel.flashinfer_cutedsl_int2_decode import (
             flashinfer_cutedsl_decode_attention_fwd_int2,
         )
 
         return flashinfer_cutedsl_decode_attention_fwd_int2
-    if backend == TRANSPOSED_CUTEDSL_BACKEND:
-        from sglang.QuantKernel.flashinfer_cutedsl_int2_decode_transposed import (
-            flashinfer_cutedsl_decode_attention_fwd_int2_transposed,
+    if backend == FLASHINFER_CUTEDSL_BACKEND:
+        from sglang.QuantKernel.flashinfer_cutedsl_int2_decode_optimized import (
+            flashinfer_cutedsl_decode_attention_fwd_int2_optimized,
         )
 
-        return flashinfer_cutedsl_decode_attention_fwd_int2_transposed
+        return flashinfer_cutedsl_decode_attention_fwd_int2_optimized
     if backend == "cuda":
         return cuda_decode_attention_fwd_int2
     if backend == "cuda-wgmma":
@@ -137,9 +138,7 @@ def _allocate_decode_state(
         "out": torch.empty(
             batch, q_heads, head_dim, dtype=torch.float32, device=device
         ),
-        "output_lse": torch.empty(
-            batch, q_heads, dtype=torch.float32, device=device
-        ),
+        "output_lse": torch.empty(batch, q_heads, dtype=torch.float32, device=device),
         "split_out": torch.empty(
             batch,
             q_heads,
@@ -194,9 +193,7 @@ def _allocate_sliced_decode_state(
         "out": torch.empty(
             batch, q_heads, head_dim, dtype=torch.float32, device=device
         ),
-        "output_lse": torch.empty(
-            batch, q_heads, dtype=torch.float32, device=device
-        ),
+        "output_lse": torch.empty(batch, q_heads, dtype=torch.float32, device=device),
         "split_out": split_out,
         "split_lse": split_lse,
         "combined_out": combined_out,
@@ -287,13 +284,14 @@ def _make_full_decode_runner(
 
 def bench_quantize(num_tokens: int, num_heads: int, head_dim: int):
     device = "cuda"
-    x = torch.randn(num_tokens, num_heads, head_dim,
-                    dtype=torch.bfloat16, device=device)
+    x = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     loc = torch.arange(num_tokens, dtype=torch.int32, device=device)
-    cache = torch.empty(num_tokens, num_heads, head_dim // 4,
-                        dtype=torch.uint8, device=device)
-    sz = torch.empty(num_tokens, num_heads, 2,
-                     dtype=torch.float32, device=device)
+    cache = torch.empty(
+        num_tokens, num_heads, head_dim // 4, dtype=torch.uint8, device=device
+    )
+    sz = torch.empty(num_tokens, num_heads, 2, dtype=torch.float32, device=device)
     x2 = torch.randn_like(x)
     cache2 = torch.empty_like(cache)
     sz2 = torch.empty_like(sz)
@@ -306,7 +304,9 @@ def bench_quantize(num_tokens: int, num_heads: int, head_dim: int):
         _launch_quantize_one(x, loc, cache, sz, None)
         _launch_quantize_one(x2, loc, cache2, sz2, None)
 
-    run_tri(); run_dsl(); torch.cuda.synchronize()
+    run_tri()
+    run_dsl()
+    torch.cuda.synchronize()
     tri_ms = _bench(run_tri)
     dsl_ms = _bench(run_dsl)
     bytes_read = x.element_size() * x.numel()
@@ -318,7 +318,10 @@ def bench_quantize(num_tokens: int, num_heads: int, head_dim: int):
 
 
 def _bench_flashinfer_decode(
-    batch: int, q_heads: int, kv_heads: int, head_dim: int,
+    batch: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
     seq_len: int,
 ):
     """Run a fp16 single-query decode through FlashInfer for the same shape.
@@ -328,6 +331,7 @@ def _bench_flashinfer_decode(
         return None, None
     try:
         import flashinfer
+
         device = "cuda"
         dtype = torch.float16
 
@@ -336,34 +340,51 @@ def _bench_flashinfer_decode(
         page_size = 1
         num_pages = batch * seq_len
         kv_cache = torch.randn(
-            num_pages, 2, kv_heads, page_size, head_dim,
-            dtype=dtype, device=device,
+            num_pages,
+            2,
+            kv_heads,
+            page_size,
+            head_dim,
+            dtype=dtype,
+            device=device,
         )
         kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
         kv_indptr = torch.arange(
-            0, num_pages + seq_len, seq_len, dtype=torch.int32, device=device,
+            0,
+            num_pages + seq_len,
+            seq_len,
+            dtype=torch.int32,
+            device=device,
         )[: batch + 1]
         kv_last_page_len = torch.full(
-            (batch,), page_size, dtype=torch.int32, device=device,
+            (batch,),
+            page_size,
+            dtype=torch.int32,
+            device=device,
         )
         q = torch.randn(batch, q_heads, head_dim, dtype=dtype, device=device)
 
         workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
         wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
         wrapper.plan(
-            kv_indptr, kv_indices, kv_last_page_len,
-            q_heads, kv_heads, head_dim, page_size,
-            q_data_type=dtype, kv_data_type=dtype,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            q_heads,
+            kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
         )
 
         def run():
             wrapper.run(q, kv_cache)
 
-        run(); torch.cuda.synchronize()
+        run()
+        torch.cuda.synchronize()
         ms = _bench(run)
-        fp16_bytes = (
-            batch * seq_len * kv_heads * head_dim * 2 * 2  # fp16 K + V
-        )
+        fp16_bytes = batch * seq_len * kv_heads * head_dim * 2 * 2  # fp16 K + V
         gbps = fp16_bytes / (ms * 1e-3) / 1e9
         return ms, gbps
     except Exception:
@@ -375,8 +396,12 @@ def _bench_flashinfer_decode(
 
 
 def bench_decode(
-    batch: int, q_heads: int, kv_heads: int, head_dim: int,
-    seq_len: int, max_splits: int,
+    batch: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    seq_len: int,
+    max_splits: int,
     backends: Sequence[str] = COMPARE_BACKENDS,
 ):
     device = "cuda"
@@ -389,8 +414,9 @@ def bench_decode(
     num_tokens = batch * seq_len
     k = torch.randn(num_tokens, kv_heads, head_dim, dtype=dtype, device=device)
     v = torch.randn(num_tokens, kv_heads, head_dim, dtype=dtype, device=device)
-    k_packed = torch.empty(num_tokens, kv_heads, head_dim // 4,
-                           dtype=torch.uint8, device=device)
+    k_packed = torch.empty(
+        num_tokens, kv_heads, head_dim // 4, dtype=torch.uint8, device=device
+    )
     v_packed = torch.empty_like(k_packed)
     k_sz = torch.empty(num_tokens, kv_heads, 2, dtype=torch.float32, device=device)
     v_sz = torch.empty_like(k_sz)
@@ -409,16 +435,15 @@ def bench_decode(
         )
 
     q = torch.randn(batch, q_heads, head_dim, dtype=dtype, device=device)
-    kv_indptr = torch.arange(0, (batch + 1) * seq_len, seq_len,
-                              dtype=torch.int32, device=device)
+    kv_indptr = torch.arange(
+        0, (batch + 1) * seq_len, seq_len, dtype=torch.int32, device=device
+    )
     kv_indices = loc
     num_kv_splits = torch.full((batch,), max_splits, dtype=torch.int32, device=device)
-    sm_scale = 1.0 / (head_dim ** 0.5)
+    sm_scale = 1.0 / (head_dim**0.5)
 
     states = {
-        backend: _allocate_decode_state(
-            batch, q_heads, head_dim, max_splits, device
-        )
+        backend: _allocate_decode_state(batch, q_heads, head_dim, max_splits, device)
         for backend in backends
     }
     runners = {
@@ -447,15 +472,15 @@ def bench_decode(
     # Effective INT2 bytes touched (packed K + V + scale/zero for active heads).
     int2_bytes = (
         batch * seq_len * kv_heads * (head_dim // 4) * 2  # packed K+V
-        + batch * seq_len * kv_heads * 2 * 4 * 2          # scale/zero (fp32)
+        + batch * seq_len * kv_heads * 2 * 4 * 2  # scale/zero (fp32)
     )
     effective_gbps = {
-        backend: int2_bytes / (ms * 1e-3) / 1e9
-        for backend, ms in elapsed_ms.items()
+        backend: int2_bytes / (ms * 1e-3) / 1e9 for backend, ms in elapsed_ms.items()
     }
 
-    fi_ms, fi_gbps = _bench_flashinfer_decode(batch, q_heads, kv_heads,
-                                               head_dim, seq_len)
+    fi_ms, fi_gbps = _bench_flashinfer_decode(
+        batch, q_heads, kv_heads, head_dim, seq_len
+    )
     return elapsed_ms, effective_gbps, fi_ms, fi_gbps
 
 
@@ -518,8 +543,7 @@ def _make_correctness_case(
     batch = len(seq_lens)
     total_kv = sum(seq_lens)
     max_tokens_per_split = max(
-        math.ceil(seq / split)
-        for seq, split in zip(seq_lens, runtime_splits)
+        math.ceil(seq / split) for seq, split in zip(seq_lens, runtime_splits)
     )
     cache_size = max(total_kv + 17, max_splits * max_tokens_per_split)
 
@@ -530,9 +554,7 @@ def _make_correctness_case(
         cache_size, kv_heads, head_dim // 4, dtype=torch.uint8, device=device
     )
     v_packed = torch.empty_like(k_packed)
-    k_sz = torch.empty(
-        cache_size, kv_heads, 2, dtype=torch.float32, device=device
-    )
+    k_sz = torch.empty(cache_size, kv_heads, 2, dtype=torch.float32, device=device)
     v_sz = torch.empty_like(k_sz)
     loc = torch.arange(cache_size, dtype=torch.int32, device=device)
     _launch_quantize_int2(k, loc, k_packed, k_sz, None)
@@ -545,9 +567,7 @@ def _make_correctness_case(
     kv_indptr = torch.tensor(indptr_host, dtype=torch.int32, device=device)
     kv_indices = torch.randperm(cache_size, device=device)[:total_kv]
     kv_indices = kv_indices.to(kv_indices_dtype).contiguous()
-    num_kv_splits = torch.tensor(
-        runtime_splits, dtype=torch.int32, device=device
-    )
+    num_kv_splits = torch.tensor(runtime_splits, dtype=torch.int32, device=device)
 
     return {
         "q": q,
@@ -586,7 +606,11 @@ def _run_unified_contract_case(
     stage1_fn = _get_stage1_fn(backend)
 
     q_heads, kv_heads = 32, 8
-    seq_lens, runtime_splits, max_splits = (65, 37), (3, 2), 4
+    if backend == FLASHINFER_CUTEDSL_BACKEND:
+        # Exercise the production register-sourced kernel at high batch.
+        seq_lens, runtime_splits, max_splits = (17,) * 16, (1,) * 16, 2
+    else:
+        seq_lens, runtime_splits, max_splits = (65, 37), (3, 2), 4
     case = _make_correctness_case(
         q_heads,
         kv_heads,
@@ -598,11 +622,15 @@ def _run_unified_contract_case(
         kv_indices_dtype=torch.int64,
     )
     batch = len(seq_lens)
-    ref_state = _allocate_decode_state(
-        batch, q_heads, head_dim, max_splits, "cuda"
-    )
+    ref_state = _allocate_decode_state(batch, q_heads, head_dim, max_splits, "cuda")
+    prefix_splits = 1 if backend == FLASHINFER_CUTEDSL_BACKEND else 8
     opt_state = _allocate_sliced_decode_state(
-        batch, q_heads, head_dim, max_splits, "cuda"
+        batch,
+        q_heads,
+        head_dim,
+        max_splits,
+        "cuda",
+        prefix_splits=prefix_splits,
     )
     ref_runner = _make_full_decode_runner(
         TRITON_BACKEND,
@@ -661,10 +689,8 @@ def _run_unified_contract_case(
     out_max_abs = (ref_out - out).abs().max().item()
     lse_max_abs = (ref_lse - output_lse).abs().max().item()
     close_out = _is_close(out, ref_out, atol=out_atol, rtol=out_rtol)
-    close_lse = _is_close(
-        output_lse, ref_lse, atol=lse_atol, rtol=lse_rtol
-    )
-    label = case["label"] + " int64+sliced-unified"
+    close_lse = _is_close(output_lse, ref_lse, atol=lse_atol, rtol=lse_rtol)
+    label = case["label"] + f" int64+sliced-unified(prefix={prefix_splits})"
     return label, cos, out_max_abs, lse_max_abs, close_out and close_lse
 
 
@@ -702,6 +728,9 @@ def _test_correctness(
         (8, 8, (33,), (2,), 4),
         # Variable-length GQA with different runtime split counts per request.
         (32, 8, (65, 37), (3, 2), 4),
+        # Exercise the optimized high-batch register-sourced route for both groups.
+        (8, 8, (17,) * 16, (1,) * 16, 2),
+        (32, 8, (17,) * 16, (1,) * 16, 2),
     ]
     if not quick:
         cases.append((32, 8, (4097,), (8,), 8))
@@ -722,9 +751,7 @@ def _test_correctness(
 
     min_cos = 1.0
     failed = False
-    for case_idx, (q_heads, kv_heads, seq_lens, splits, max_splits) in enumerate(
-        cases
-    ):
+    for case_idx, (q_heads, kv_heads, seq_lens, splits, max_splits) in enumerate(cases):
         case = _make_correctness_case(
             q_heads,
             kv_heads,
@@ -807,12 +834,8 @@ def _test_correctness(
             ).item()
             out_max_abs = (ref_out - out).abs().max().item()
             lse_max_abs = (ref_lse - output_lse).abs().max().item()
-            close_out = _is_close(
-                out, ref_out, atol=out_atol, rtol=out_rtol
-            )
-            close_lse = _is_close(
-                output_lse, ref_lse, atol=lse_atol, rtol=lse_rtol
-            )
+            close_out = _is_close(out, ref_out, atol=out_atol, rtol=out_rtol)
+            close_lse = _is_close(output_lse, ref_lse, atol=lse_atol, rtol=lse_rtol)
             passed = cos >= cos_threshold and close_out and close_lse
             min_cos = min(min_cos, cos if math.isfinite(cos) else -1.0)
             failed |= not passed
@@ -823,21 +846,19 @@ def _test_correctness(
             )
 
     for backend in (
+        FLASHINFER_CUTEDSL_BASELINE_BACKEND,
         FLASHINFER_CUTEDSL_BACKEND,
-        TRANSPOSED_CUTEDSL_BACKEND,
     ):
         if backend not in backends:
             continue
         try:
-            label, cos, out_max_abs, lse_max_abs, close = (
-                _run_unified_contract_case(
-                    backend=backend,
-                    head_dim=head_dim,
-                    out_atol=out_atol,
-                    out_rtol=out_rtol,
-                    lse_atol=lse_atol,
-                    lse_rtol=lse_rtol,
-                )
+            label, cos, out_max_abs, lse_max_abs, close = _run_unified_contract_case(
+                backend=backend,
+                head_dim=head_dim,
+                out_atol=out_atol,
+                out_rtol=out_rtol,
+                lse_atol=lse_atol,
+                lse_rtol=lse_rtol,
             )
             passed = cos >= cos_threshold and close
             min_cos = min(min_cos, cos if math.isfinite(cos) else -1.0)
@@ -880,32 +901,49 @@ def main():
     global _BENCH_WARMUP, _BENCH_REP
 
     p = argparse.ArgumentParser()
-    p.add_argument("--assert-speedup", type=float, default=None,
-                   help="Fail if the primary selected backend's minimum "
-                        "speedup over Triton is below this value.")
+    p.add_argument(
+        "--assert-speedup",
+        type=float,
+        default=None,
+        help="Fail if the primary selected backend's minimum "
+        "speedup over Triton is below this value.",
+    )
     p.add_argument("--head-dim", type=int, default=128)
-    p.add_argument("--gqa", action="store_true",
-                   help="Use Qwen3-4B GQA shapes (q=32, kv=8, group=4).")
-    p.add_argument("--quantize-only", action="store_true",
-                   help="Skip decode benchmark.")
+    p.add_argument(
+        "--gqa",
+        action="store_true",
+        help="Use Qwen3-4B GQA shapes (q=32, kv=8, group=4).",
+    )
+    p.add_argument(
+        "--quantize-only", action="store_true", help="Skip decode benchmark."
+    )
     p.add_argument(
         "--backend",
         choices=tuple(BACKEND_LABELS) + ("compare", "all"),
         default="compare",
         help=(
             "Single optimized backend (automatically paired with Triton), "
-            "'compare' for Triton + legacy + FI-derived baseline + transposed, or "
+            "'compare' for Triton + legacy + FI-derived baseline + optimized, or "
             "'all' to additionally include CUDA wmma/wgmma."
         ),
     )
-    p.add_argument("--test-correctness", action="store_true",
-                   help="Compare complete output and LSE against Triton for "
-                        "the selected backend set (no benchmark).")
-    p.add_argument("--dump-cosine-sim", action="store_true",
-                   help="Alias for --test-correctness; prints cos_sim line "
-                        "the harness reads.")
-    p.add_argument("--cos-threshold", type=float, default=0.999,
-                   help="Cosine-sim PASS threshold for --test-correctness.")
+    p.add_argument(
+        "--test-correctness",
+        action="store_true",
+        help="Compare complete output and LSE against Triton for "
+        "the selected backend set (no benchmark).",
+    )
+    p.add_argument(
+        "--dump-cosine-sim",
+        action="store_true",
+        help="Alias for --test-correctness; prints cos_sim line " "the harness reads.",
+    )
+    p.add_argument(
+        "--cos-threshold",
+        type=float,
+        default=0.999,
+        help="Cosine-sim PASS threshold for --test-correctness.",
+    )
     p.add_argument("--out-atol", type=float, default=0.05)
     p.add_argument("--out-rtol", type=float, default=0.05)
     p.add_argument("--lse-atol", type=float, default=0.05)
@@ -915,13 +953,31 @@ def main():
         action="store_true",
         help="Use the short correctness/performance matrix and fewer benchmark reps.",
     )
-    p.add_argument("--warmup", type=int, default=None,
-                   help="Benchmark warmup budget in ms (default: 25, quick: 3).")
-    p.add_argument("--rep", type=int, default=None,
-                   help="Benchmark measurement budget in ms (default: 200, quick: 10).")
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="Benchmark warmup budget in ms (default: 25, quick: 3).",
+    )
+    p.add_argument(
+        "--rep",
+        type=int,
+        default=None,
+        help="Benchmark measurement budget in ms (default: 200, quick: 10).",
+    )
     args = p.parse_args()
 
-    _BENCH_WARMUP = args.warmup if args.warmup is not None else (3 if args.quick else 25)
+    if args.assert_speedup is not None and (
+        args.test_correctness or args.dump_cosine_sim or args.quantize_only
+    ):
+        p.error(
+            "--assert-speedup cannot be combined with correctness-only or "
+            "quantize-only modes"
+        )
+
+    _BENCH_WARMUP = (
+        args.warmup if args.warmup is not None else (3 if args.quick else 25)
+    )
     _BENCH_REP = args.rep if args.rep is not None else (10 if args.quick else 200)
     backends = _expand_backend_selection(args.backend)
     if any(backend in ("cuda", "cuda-wgmma") for backend in backends):
@@ -945,20 +1001,26 @@ def main():
     head_dim = args.head_dim
 
     print(f"\n=== INT2 quantize benchmark (head_dim={head_dim}) ===")
-    print(f"{'shape':<30s} {'Triton ms':>10s} {'CuteDSL ms':>11s} "
-          f"{'Tri GB/s':>10s} {'DSL GB/s':>10s} {'speedup':>9s}")
+    print(
+        f"{'shape':<30s} {'Triton ms':>10s} {'CuteDSL ms':>11s} "
+        f"{'Tri GB/s':>10s} {'DSL GB/s':>10s} {'speedup':>9s}"
+    )
     q_min_speedup = float("inf")
     quant_shapes = [
-        (4096, 8), (8192, 8), (16384, 8),
+        (4096, 8),
+        (8192, 8),
+        (16384, 8),
     ]
     if args.quick:
         quant_shapes = quant_shapes[:1]
-    for (num_tokens, num_heads) in quant_shapes:
+    for num_tokens, num_heads in quant_shapes:
         tri, dsl, tg, dg = bench_quantize(num_tokens, num_heads, head_dim)
         sp = tri / dsl if dsl > 0 else float("inf")
         q_min_speedup = min(q_min_speedup, sp)
-        print(f"  T={num_tokens:>5d} H={num_heads:>2d}{'':<14s} "
-              f"{tri:>10.4f} {dsl:>11.4f} {tg:>10.1f} {dg:>10.1f} {sp:>8.2f}x")
+        print(
+            f"  T={num_tokens:>5d} H={num_heads:>2d}{'':<14s} "
+            f"{tri:>10.4f} {dsl:>11.4f} {tg:>10.1f} {dg:>10.1f} {sp:>8.2f}x"
+        )
 
     if args.quantize_only:
         print(f"\nmin quantize speedup: {q_min_speedup:.4f}x")
@@ -966,8 +1028,10 @@ def main():
 
     shapes = _decode_shape_list(args.gqa, quick=args.quick)
     tag = "GQA (q=32,kv=8)" if args.gqa else "MHA (q=8,kv=8)"
-    print(f"\n=== INT2 decode attention benchmark "
-          f"(head_dim={head_dim}, {tag}, complete stage1+stage2) ===")
+    print(
+        f"\n=== INT2 decode attention benchmark "
+        f"(head_dim={head_dim}, {tag}, complete stage1+stage2) ==="
+    )
     print("Backends: " + ", ".join(BACKEND_LABELS[b] for b in backends))
 
     print(
@@ -975,16 +1039,19 @@ def main():
         f"{'eff GB/s':>11s} {'vs Triton':>11s}"
     )
     min_speedup = {
-        backend: float("inf")
-        for backend in backends
-        if backend != TRITON_BACKEND
+        backend: float("inf") for backend in backends if backend != TRITON_BACKEND
     }
     last_gbps = None
     last_fi_gbps = None
     last_seq = None
-    for (batch, q_heads, kv_heads, seq, splits) in shapes:
+    for batch, q_heads, kv_heads, seq, splits in shapes:
         elapsed_ms, effective_gbps, fi_ms, fi_gbps = bench_decode(
-            batch, q_heads, kv_heads, head_dim, seq, splits,
+            batch,
+            q_heads,
+            kv_heads,
+            head_dim,
+            seq,
+            splits,
             backends=backends,
         )
         tri_ms = elapsed_ms[TRITON_BACKEND]
@@ -1034,8 +1101,8 @@ def main():
         if not min_speedup:
             p.error("--assert-speedup requires an optimized backend")
         gate_backend = (
-            TRANSPOSED_CUTEDSL_BACKEND
-            if TRANSPOSED_CUTEDSL_BACKEND in min_speedup
+            FLASHINFER_CUTEDSL_BACKEND
+            if FLASHINFER_CUTEDSL_BACKEND in min_speedup
             else next(reversed(min_speedup))
         )
         measured = min_speedup[gate_backend]
