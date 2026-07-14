@@ -42,14 +42,15 @@ GROUP_SIZE="${GROUP_SIZE:-128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 NUM_WORKERS="${NUM_WORKERS:-32}"
 N_REPEATS="${N_REPEATS:-1}"
+EVAL_SEED="${EVAL_SEED:-12345}"
 NAME="${NAME:-gpqa_oscar}"
 
-CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV_NAME}"
+#CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
+#CONDA_ENV_NAME="${CONDA_ENV_NAME:-oscar}"
+#source "${CONDA_BASE}/etc/profile.d/conda.sh"
+#conda activate "${CONDA_ENV_NAME}"
 
-export PATH="${CONDA_PREFIX}/bin:${PATH}"
+#export PATH="${CONDA_PREFIX}/bin:${PATH}"
 # Prepend per-rank Triton cache redirector so TP workers don't race on shared
 # launcher .so / metadata files in TRITON_CACHE_DIR.
 export PYTHONPATH="${REPO_ROOT}/rotation/_triton_per_rank:${SGLANG_RESEARCH_DIR}/python:${PYTHONPATH:-}"
@@ -89,6 +90,7 @@ SERVER_ARGS=(
     --kv-cache-quant-group-size "${GROUP_SIZE}"
     --mem-fraction-static "${MEM_FRAC}"
     --max-running-requests "${MAX_RUNNING}"
+    --random-seed "${EVAL_SEED}"
     --enable-cache-report
     --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}"
     --host 127.0.0.1
@@ -156,6 +158,7 @@ python "${RUNNER}" \
     --temperature "${TEMPERATURE:-1.0}" \
     --top-p "${TOP_P:-0.95}" \
     --top-k "${TOP_K:-40}" \
+    --seed "${EVAL_SEED}" \
     --n-repeats "${N_REPEATS}" \
     --num-threads "${NUM_WORKERS:-32}" \
     ${NUM_EXAMPLES:+--num-examples ${NUM_EXAMPLES}} \

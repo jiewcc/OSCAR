@@ -11,7 +11,7 @@ rotation/*/MMLU/
 rotation/*/Hadamard/
 rotation/*/qkv_dumps*/
 rotation/*/rotations*/
-rotation/*/_eval_*/
+rotation/**/_eval_*/
 rotation/*/investigation/
 
 # MiniMax-M2.7 is internal-only for now (per-investigation work-in-progress).

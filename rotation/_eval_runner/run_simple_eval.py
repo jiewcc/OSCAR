@@ -43,6 +43,7 @@ def _build_argparser():
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=40)
+    p.add_argument("--seed", type=int, default=12345)
     p.add_argument("--n-repeats", type=int, default=1)
     p.add_argument("--num-examples", type=int, default=None,
                    help="Restrict to N examples (default: all)")
@@ -64,7 +65,7 @@ class SglangChatSampler:
     image_format = "url"
 
     def __init__(self, model, base_url, api_key, system_message,
-                 temperature, top_p, top_k, max_tokens):
+                 temperature, top_p, top_k, max_tokens, seed):
         import httpx
         from openai import OpenAI
         # Long read timeout: thinking models generate 20-40k tokens; at 10 tok/s
@@ -80,6 +81,7 @@ class SglangChatSampler:
         self.top_p = top_p
         self.top_k = top_k
         self.max_tokens = max_tokens
+        self.seed = seed
 
     def _pack_message(self, role, content):
         return {"role": str(role), "content": content}
@@ -101,6 +103,7 @@ class SglangChatSampler:
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     top_p=self.top_p,
+                    seed=self.seed,
                     extra_body={"top_k": self.top_k},
                 )
                 content = resp.choices[0].message.content
@@ -136,6 +139,7 @@ def main():
         model=args.model, base_url=args.base_url, api_key=args.api_key,
         system_message=args.system_message, temperature=args.temperature,
         top_p=args.top_p, top_k=args.top_k, max_tokens=args.max_tokens,
+        seed=args.seed,
     )
 
     # Cap simple-evals' map_with_progress concurrency. GPQAEval.__call__

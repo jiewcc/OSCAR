@@ -602,7 +602,7 @@ class RadixCache(BasePrefixCache):
         # is shortened, covers the HP-recent tail, the live slots in any
         # unaligned quant tail page, and that page's owned slack slots in one
         # call.
-        mixed_trim = self._mixed_kv_tail_to_drop(len(keys), kv_indices)
+        mixed_trim = self._mixed_kv_tail_to_drop(len(keys))
         if mixed_trim > 0:
             keys = keys[: len(keys) - mixed_trim]
             values = values[: len(keys)]
@@ -670,7 +670,7 @@ class RadixCache(BasePrefixCache):
         # still owns those HP slots (they stay addressable via the
         # ``torch.cat`` branch below that rebuilds ``req.prefix_indices``),
         # so we must not free them here. See :meth:`_mixed_kv_tail_to_drop`.
-        mixed_trim = self._mixed_kv_tail_to_drop(len(keys), kv_indices)
+        mixed_trim = self._mixed_kv_tail_to_drop(len(keys))
         if mixed_trim > 0:
             insert_keys = keys[: len(keys) - mixed_trim]
             insert_values = values[: len(insert_keys)]
@@ -914,7 +914,7 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _mixed_kv_tail_to_drop(self, committed_len: int, kv_indices: Optional[torch.Tensor] = None) -> int:
+    def _mixed_kv_tail_to_drop(self, committed_len: int) -> int:
         # HP-recent slot ids are per-request and must not enter the tree.
         # Trim a fixed ``hp_recent + flush_overflow`` window from the
         # tail (page-aligned, ceil'd), which fully covers the worst-case

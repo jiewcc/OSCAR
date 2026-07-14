@@ -23,6 +23,12 @@ def _jit_apply_rope_pos_ids_cos_sin_cache_module() -> Module:
         f"flashinfer headers are missing {str(flashinfer_dir / 'data' / 'include')}"
     )
     flashinfer_include_path = (flashinfer_dir / "data" / "include").resolve()
+    flashinfer_cccl_root = (flashinfer_dir / "data" / "cccl").resolve()
+    flashinfer_cccl_include_paths = [
+        str(flashinfer_cccl_root / "thrust"),
+        str(flashinfer_cccl_root / "libcudacxx" / "include"),
+        str(flashinfer_cccl_root / "cub"),
+    ]
     return load_jit(
         "apply_rope_pos_ids_cos_sin_cache",
         cuda_files=["elementwise/rope.cuh"],
@@ -32,7 +38,7 @@ def _jit_apply_rope_pos_ids_cos_sin_cache_module() -> Module:
                 "ApplyRopePosIdsCosSinCacheKernel::run",
             )
         ],
-        extra_include_paths=[str(flashinfer_include_path)],
+        extra_include_paths=flashinfer_cccl_include_paths + [str(flashinfer_include_path)],
     )
 
 
