@@ -719,12 +719,10 @@ def gpu_flush_int2_apply(
         v_head_dim, v_num_scale_groups
     )
 
-    if rotation_mode == "coquant":
-        k_clip_index = _flush_clip_index(k_clip_ratio, head_dim)
-        v_clip_index = _flush_clip_index(v_clip_ratio, v_head_dim)
-    else:
-        k_clip_index = -1
-        v_clip_index = -1
+    # Clipping is controlled by the configured ratios. A non-positive ratio
+    # already maps to -1 and disables clipping.
+    k_clip_index = _flush_clip_index(k_clip_ratio, head_dim)
+    v_clip_index = _flush_clip_index(v_clip_ratio, v_head_dim)
 
     elements_per_thread = _flush_elements_per_thread(hp_k_sample.dtype)
     block_tok, num_warps = _flush_block_tok_and_num_warps(
